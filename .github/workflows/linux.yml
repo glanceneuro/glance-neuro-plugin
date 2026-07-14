@@ -1,0 +1,46 @@
+name: linux
+
+on: 
+  push:
+    branches: [main]
+  pull_request:
+    
+env:
+  ARTIFACTORY_ACCESS_TOKEN: ${{ secrets.ARTIFACTORY_ACCESS_TOKEN }}
+  build_dir: "Build"
+  package: EphysSocket-linux
+
+jobs:
+  build-linux:
+    runs-on: [ubuntu-22.04]
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: setup
+      run: |
+        sudo apt update
+        cd ../..
+        git clone https://github.com/open-ephys/plugin-GUI.git --branch main
+        sudo ./plugin-GUI/Resources/Scripts/install_linux_dependencies.sh
+        cd plugin-GUI/Build && cmake -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release ..
+
+    - name: build
+      id: build
+      run: |
+        cd Build
+        cmake -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release ..
+        make
+
+    - name: deploy
+      if: github.ref == 'refs/heads/main' && steps.build.outcome == 'success'
+      run: |
+        plugin_api=$(grep -rnw ../../plugin-GUI/Source -e '#define PLUGIN_API_VER' | grep -Eo "[0-9]*" | tail -1)
+        tag=$(grep -w Source/OpenEphysLib.cpp -e 'info->libVersion' | grep -Eo "[0-9]+.[0-9]+.[0-9]+")
+        new_plugin_ver=$tag-API$plugin_api
+        mkdir plugins 
+        cp -r $build_dir/*.so plugins
+        zipfile=${package}_${new_plugin_ver}.zip
+        zip -r -X $zipfile plugins
+        curl -H "X-JFrog-Art-Api:$ARTIFACTORY_ACCESS_TOKEN" -T $zipfile "https://openephys.jfrog.io/artifactory/EphysSocket-plugin/linux/$zipfile"
