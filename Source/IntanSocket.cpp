@@ -6,6 +6,40 @@
 
 #include <sstream>
 
+#ifdef __APPLE__
+// Disable macOS App Nap for this (plugin-container) process so the OS doesn't throttle
+// it a few seconds into acquisition and starve the UDP recv thread (packet loss that
+// starts ~10 s in). Done through the Obj-C runtime directly -- no .mm file, no
+// Foundation link -- so it can't affect whether the bundle loads. Equivalent to:
+//   token = [[[NSProcessInfo processInfo] beginActivityWithOptions:opts reason:@"…"] retain];
+#include <objc/objc.h>
+#include <objc/runtime.h>
+#include <objc/message.h>
+static void disableAppNap()
+{
+    static id token = nullptr;
+    if (token != nullptr)
+        return;                                  // already active for this process
+    Class piClass  = objc_getClass("NSProcessInfo");
+    Class strClass = objc_getClass("NSString");
+    if (piClass == nullptr || strClass == nullptr)
+        return;
+    auto msgClsSel    = reinterpret_cast<id(*)(Class, SEL)>(objc_msgSend);
+    auto msgClsSelStr = reinterpret_cast<id(*)(Class, SEL, const char*)>(objc_msgSend);
+    auto msgObjSel    = reinterpret_cast<id(*)(id, SEL)>(objc_msgSend);
+    auto msgActivity  = reinterpret_cast<id(*)(id, SEL, unsigned long long, id)>(objc_msgSend);
+    id reason = msgClsSelStr(strClass, sel_registerName("stringWithUTF8String:"),
+                             "ephys-socket real-time UDP acquisition");
+    id pi = msgClsSel(piClass, sel_registerName("processInfo"));
+    // NSActivityUserInitiated (0x00FFFFFF) | NSActivityLatencyCritical (0xFF00000000).
+    const unsigned long long opts = 0x00FFFFFFULL | 0xFF00000000ULL;
+    id activity = msgActivity(pi, sel_registerName("beginActivityWithOptions:reason:"), opts, reason);
+    token = msgObjSel(activity, sel_registerName("retain"));   // keep the activity alive
+    std::cout << "[ephys-socket] App Nap disabled for acquisition (NSActivityLatencyCritical)"
+              << std::endl;
+}
+#endif
+
 using namespace IntanSocketNode;
 
 DataThread* IntanSocket::createDataThread(SourceNode* sn)
@@ -214,8 +248,9 @@ bool IntanSocket::connectDevice(bool printOutput)
         num_channels = calculateNumChannels(channel_enable_mask);
         debugMode = (status.debugMode != 0);
 
-        // Aux sequencer state (already persisted across reconnect)
-        auxSeqMode   = status.hasAuxStatus && status.auxSeqEnabled;
+        // The board boots into the accel sweep (slot 0 cycles CONVERT 32->33->34) and
+        // the de-interleave always runs in sweep form -- there is no alternate mode.
+        // auxSeqMode is just a local UI-state flag; it stays true from connect on.
 
         // Fast-settle / TTL state: prefer the new aux_ctrl readback
         // (firmware 65d5fb5+) which surfaces the actual SW level and TTL
@@ -465,6 +500,12 @@ bool IntanSocket::startAcquisition()
         LOGE("Cannot start acquisition - device not ready");
         return false;
     }
+
+#ifdef __APPLE__
+    // Keep macOS from App-Napping the plugin-container process a few seconds in and
+    // starving the UDP recv thread (loss that starts ~10 s into acquisition).
+    disableAppNap();
+#endif
     
     // Resize buffers - ONE time sample per packet across all channels
     convbuf.resize(num_channels);      // one time sample per channel
@@ -528,8 +569,9 @@ bool IntanSocket::stopAcquisition()
     if (isThreadRunning())
     {
         signalThreadShouldExit();
+        queueCv_.notify_all();   // wake updateBuffer() if it's blocked so run() exits now
     }
-    
+
     if (intanInterface)
     {
         intanInterface->stopAcquisition();
@@ -545,22 +587,35 @@ void IntanSocket::processDataPacket(const uint32_t* data, size_t wordCount, uint
 {
     // Called from IntanInterface's UDP thread
     // Queue the packet for processing in updateBuffer()
-    
-    std::lock_guard<std::mutex> lock(queueMutex);
+
+    std::unique_lock<std::mutex> lock(queueMutex);
 
     if (dataQueue.size() >= kMaxDataQueue) {
         // Consumer fell behind -> drop the OLDEST and count it, rather than grow
         // the queue without bound (see kMaxDataQueue note). A counted, bounded
         // drop here is far better than the uncounted allocator-stall spiral.
+        // Recycle the dropped buffer instead of freeing it.
+        if (bufferPool_.size() < kBufferPoolMax)
+            bufferPool_.push_back(std::move(dataQueue.front().data));
         dataQueue.pop();
         dataQueueDrops_.fetch_add(1, std::memory_order_relaxed);
     }
 
+    // Reuse a pooled buffer so this hot path (running ON the demux thread) does NO
+    // per-packet heap alloc -- assign() into an already-sized buffer reuses its
+    // capacity. A fresh alloc here is what churns the allocator and stalls the demux
+    // -> ring backup -> SEQ gaps (net.py avoids exactly this by never allocating).
     DataPacket packet;
-    packet.data.assign(data, data + wordCount);
+    if (!bufferPool_.empty()) {
+        packet.data = std::move(bufferPool_.back());
+        bufferPool_.pop_back();
+    }
+    packet.data.assign(data, data + wordCount);   // reuses capacity: no realloc
     packet.timestamp = timestamp;
 
     dataQueue.push(std::move(packet));   // move, not copy
+    lock.unlock();
+    queueCv_.notify_one();               // wake the (blocked) DataThread
 }
 
 bool IntanSocket::updateBuffer()
@@ -584,24 +639,58 @@ bool IntanSocket::updateBuffer()
         if (now - lastLog > std::chrono::seconds(5)) {
             lastLog = now;
             uint64_t d = dataQueueDrops_.load(std::memory_order_relaxed);
-            if (d != lastDrops) {
-                size_t qsz;
-                { std::lock_guard<std::mutex> lock(queueMutex); qsz = dataQueue.size(); }
-                std::cout << "[IntanSocket][DROP] dataQueue overflow (OE consumer too slow): "
-                          << "dataQueueDrops=" << d << " (+" << (d - lastDrops)
-                          << "/5s), queue=" << qsz << "/" << kMaxDataQueue
-                          << " -- SILENT loss, downstream of the SEQ check" << std::endl;
-                lastDrops = d;
-            }
+            size_t qsz;
+            { std::lock_guard<std::mutex> lock(queueMutex); qsz = dataQueue.size(); }
+            int sb = sourceBuffers[0]->getNumSamples();
+            // Standing pipeline latency per stage -- should hover near ZERO (the big
+            // buffers are for burst absorption, not steady occupancy). sourceBuffer
+            // fill / SAMPLE_RATE is the display latency you feel; dataQueue should stay
+            // ~empty now that updateBuffer drains to empty. If sourceBuffer stays deep
+            // while dataQueue is ~0, the standing depth is in OE's own buffer (a paced
+            // consumer), not ours.
+            std::cout << "[IntanSocket][LATENCY] sourceBuffer=" << sb << " samp ("
+                      << (sb * 1000.0 / SAMPLE_RATE) << " ms), dataQueue=" << qsz
+                      << "/" << kMaxDataQueue;
+            if (d != lastDrops)
+                std::cout << "  DROPS +" << (d - lastDrops) << "/5s (total " << d << ")";
+            std::cout << std::endl;
+            lastDrops = d;
         }
     }
 
-    // Get packet from queue
+    // BLOCK (bounded) until a packet is queued instead of returning immediately. The OE
+    // DataThread::run() loop calls updateBuffer() with NO sleep, so a fast return on an
+    // empty queue spins a whole CPU core -- self-inflicted load that starves the recv/
+    // kernel path (net.py blocks on recv and uses ~1/4 the CPU). The 100 ms cap lets
+    // run() still poll threadShouldExit() promptly.
+    {
+        std::unique_lock<std::mutex> lock(queueMutex);
+        if (dataQueue.empty() && !hasError)
+            queueCv_.wait_for(lock, std::chrono::milliseconds(100),
+                              [this] { return !dataQueue.empty() || hasError || threadShouldExit(); });
+    }
+
+    // Drain EVERY queued packet this call so the dataQueue can never build a standing
+    // backlog -> latency (the "big buffer, kept empty" rule: the buffer is for burst
+    // absorption, not steady occupancy). OE calls updateBuffer in a tight loop, but its
+    // per-call overhead can drop the effective rate below the ~30 kHz arrival rate;
+    // one-packet-per-call then leaves a PERMANENT queue that shows up as display lag.
+    // Looping to empty decouples our drain from OE's call cadence. Nothing is dropped.
+    std::vector<uint32_t> recycle;   // previous packet's buffer, returned to the pool
+    while (true)
+    {
     DataPacket packet;
     {
         std::lock_guard<std::mutex> lock(queueMutex);
+        // Return the previous iteration's buffer to the pool under the SAME lock as
+        // the next pop -- recycling costs no extra lock. The producer then reuses it
+        // (no per-packet alloc). capacity()>0 distinguishes a real buffer from a
+        // moved-from empty one.
+        if (recycle.capacity() > 0 && bufferPool_.size() < kBufferPoolMax)
+            bufferPool_.push_back(std::move(recycle));
+        recycle = std::vector<uint32_t>{};   // moved-from -> guaranteed empty/no capacity
         if (dataQueue.empty())
-            return true;
+            break;
 
         packet = std::move(dataQueue.front());   // move out, no copy
         dataQueue.pop();
@@ -615,7 +704,7 @@ bool IntanSocket::updateBuffer()
     int64 timestamp = (static_cast<uint64_t>(packet.data.data()[3]) << 32) | packet.data.data()[2];
 
     // Skip the full 14-word unified broadband header; the data words that
-    // follow are byte-identical to the legacy stream.
+    // follow are unchanged by the header reformat.
     const uint32_t* dataWords = packet.data.data() + kBroadbandHeaderWords;
     size_t numDataWords = packet.data.size() - kBroadbandHeaderWords;
 
@@ -721,35 +810,27 @@ bool IntanSocket::updateBuffer()
     // count, lossless. The midscale subtraction is a constant, reversible
     // representation choice, not a baseline/detrend.
     //
-    // TWO FORMATS, distinguished PER PACKET by the aux flags in header word 4
-    // (the packet is self-describing -- stays correct through live bank swaps
-    // and sequencer enable/disable -- firmware aux-seq-v2):
+    // The accel sweep lives on aux slot 0 (cycle 32), so its command echo AND its
+    // reply ride the SAME packet: header word 6 [31:16] carries the CONVERT(32|33|34)
+    // command -- the axis label -- and the +2 SPI readback puts that axis's sample in
+    // data word 34 of this very packet. De-interleave by echo with sample-and-hold so
+    // the 3 output channels stay at the full 30 kHz buffer rate (each axis refreshes
+    // every 3rd packet). Because label and sample never cross a packet boundary, a
+    // dropped packet can't mislabel an axis.
+    //   (Data words 0/1 = slots 1/2's replies -- the fs 'I' register read and the
+    //    inject register / injected-read result -- neither is accelerometer data.)
     //
-    //  * Legacy (sequencer off, flags==0): the static table converts all
-    //    three aux inputs every packet; results sit at cycles 34/0/1.
-    //
-    //  * Aux-sequencer mode (flags bit0 set): slot 1 sweeps ONE accelerometer
-    //    axis per packet (CONVERT 32 -> 33 -> 34 looping, 10 kHz per axis).
-    //    Its result arrives at cycle 0 of the FOLLOWING packet, and that
-    //    packet's header word 5 [15:0] echoes the originating command, which
-    //    identifies the axis. De-interleave by echo with sample-and-hold so
-    //    the 3 output channels stay at the full 30 kHz buffer rate.
-    //    (Cycle 34 = slot 0's Reg-3 write echo and cycle 1 = slot 2's
-    //    housekeeping result -- neither is accelerometer data in this mode.)
+    // The aux engine is ALWAYS ON (aux_flags bit0 is hardwired 1), so there is no
+    // "plain per-axis" fallback to select -- every packet is in sweep form.
     //
     // UNIFIED header field mapping (docs/unified-packet-format.md, net.py
     // print_aux_info):
-    //   AUX1 = common-header word 6 = {echo0[31:16], aux_flags[15:8], digital_in[7:0]}
+    //   AUX1 = common-header word 6 = {echo_sweep[31:16], aux_flags[15:8], digital_in[7:0]}
     //   sub-block word 8           = {echo_slot2_prev[31:16], echo_slot1_prev[15:0]}
-    // The slot-1 accelerometer command echo that drives the de-interleave is in
-    // the LOW 16 bits of word 8 (was word 5 in the legacy 10-word header).
-    // Port B uses the SAME header echo as port A.
+    // The accel command echo that drives the de-interleave is in the HIGH 16 bits of
+    // word 6 (THIS packet). Port B uses the SAME header echo as port A.
     {
-        uint32_t auxWord  = packet.data.data()[6];   // AUX1 (flags + digital_in + echo0)
-        uint32_t echoWord = packet.data.data()[8];   // sub-block: prev slot-1/2 echoes
-        uint8_t auxFlags = (auxWord >> 8) & 0xFF;
-        bool seqActive = (auxFlags & 0x01) != 0;
-        bool echoValid = (auxFlags & 0x10) != 0;
+        uint32_t auxWord = packet.data.data()[6];   // AUX1 (flags + digital_in + sweep echo)
 
         // Mapping from stream bit position to aux bank index.
         // Regular streams are at even bit positions 0, 2, 4, 6.
@@ -760,40 +841,22 @@ bool IntanSocket::updateBuffer()
             return b / 2;
         };
 
-        if (!seqActive)
+        uint16_t echo0 = (auxWord >> 16) & 0xFFFF;   // slot-0 (accel) cmd, answered @ data word 34
+        bool isConvert = (echo0 & 0xC000) == 0;
+        int convCh = (echo0 >> 8) & 0x3F;
+
+        for (int s = 0; s < nStreams; ++s)
         {
-            const int auxCycle[3] = {34, 0, 1};
-            for (int s = 0; s < nStreams; ++s)
-            {
-                int b = streamBits[s];
-                if ((b & 1) != 0)
-                    continue;  // skip DDR streams (odd bits)
-                for (int a = 0; a < 3; ++a)
-                {
-                    int flat = auxCycle[a] * nStreams + s;
-                    convbuf[outCh++] = (float)((int)sampleAt(flat) - 32768) * aux_data_scale;
-                }
-            }
-        }
-        else
-        {
-            uint16_t echo1 = echoWord & 0xFFFF;      // slot-1 cmd answered @ cycle 0
-            bool isConvert = (echo1 & 0xC000) == 0;
-            int convCh = (echo1 >> 8) & 0x3F;
+            int b = streamBits[s];
+            if ((b & 1) != 0)
+                continue;  // skip DDR streams (odd bits)
+            int bank = auxBankForBit(b);
 
-            for (int s = 0; s < nStreams; ++s)
-            {
-                int b = streamBits[s];
-                if ((b & 1) != 0)
-                    continue;  // skip DDR streams (odd bits)
-                int bank = auxBankForBit(b);
+            if (isConvert && convCh >= 32 && convCh <= 34)
+                lastAccel[bank][convCh - 32] = sampleAt(34 * nStreams + s);
 
-                if (echoValid && isConvert && convCh >= 32 && convCh <= 34)
-                    lastAccel[bank][convCh - 32] = sampleAt(0 * nStreams + s);
-
-                for (int a = 0; a < 3; ++a)
-                    convbuf[outCh++] = (float)((int)lastAccel[bank][a] - 32768) * aux_data_scale;
-            }
+            for (int a = 0; a < 3; ++a)
+                convbuf[outCh++] = (float)((int)lastAccel[bank][a] - 32768) * aux_data_scale;
         }
     }
 
@@ -814,6 +877,8 @@ bool IntanSocket::updateBuffer()
                                    1);  // ONE time sample
 
     totalSamples++;
+    recycle = std::move(packet.data);   // hold this buffer for the next iteration's lock
+    }  // end while: drain the next queued packet (keep the dataQueue empty)
 
     return true;
 }
@@ -1071,19 +1136,11 @@ void IntanSocket::setManualFastSettle(bool active)
         return;
     }
 
-    // The override layer only reaches the chip while the sequencer is on
-    if (active && !auxSeqMode)
-    {
-        LOGC("Fast settle requires the aux sequencer - enabling aux mode first");
-        if (!setAuxSequencerMode(true))
-            return;
-    }
-
     fastSettleSw = active;
     if (pushFastSettleConfig())
     {
         LOGC("Fast settle ", active ? "ON" : "OFF",
-             " (RHD Reg-0 D5 via slot-0 injection)");
+             " (RHD Reg-0 D5 via the override whole-replacing the fs slot)");
         CoreServices::sendStatusMessage(active ? "Intan: FAST SETTLE ON"
                                                : "Intan: fast settle off");
     }
@@ -1097,13 +1154,6 @@ void IntanSocket::setFastSettleTTLPin(int pin)
 {
     if (!intanInterface || !intanInterface->foundInputSource())
         return;
-
-    if (pin >= 0 && !auxSeqMode)
-    {
-        LOGC("TTL fast settle requires the aux sequencer - enabling aux mode first");
-        if (!setAuxSequencerMode(true))
-            return;
-    }
 
     fastSettleTTL = (pin >= 0 && pin <= 7) ? pin : -1;
     if (pushFastSettleConfig())
@@ -1128,22 +1178,12 @@ bool IntanSocket::setAuxSequencerMode(bool enable)
         return false;
     }
 
-    if (!enable)
-    {
-        // Firmware clears the live fast-settle/digout sources and waits one
-        // packet before dropping the enable (so the chip is never left
-        // clamped); mirror the local state.
-        fastSettleSw = false;
-        if (!intanInterface->auxSeqEnable(false))
-        {
-            LOGE("Failed to disable aux sequencer");
-            return false;
-        }
-        auxSeqMode = false;
-        LOGC("Aux sequencer disabled - legacy aux format (all 3 axes per packet)");
-        CoreServices::sendStatusMessage("Intan: aux sequencer off");
-        return true;
-    }
+    // The accelerometer sweep is the one and only aux configuration -- the board
+    // boots into it (slot 0 cycles CONVERT 32->33->34) and the de-interleave always
+    // runs in sweep form. This call (re)asserts that config, uploading into the
+    // STANDBY bank and swapping it live so it doubles as the double-buffer test.
+    // `enable` is retained for API/UI compatibility; there is no alternate mode.
+    (void)enable;
 
     IntanInterface::DeviceStatus status;
     if (!intanInterface->getStatus(status))
@@ -1159,54 +1199,41 @@ bool IntanSocket::setAuxSequencerMode(bool enable)
         return false;
     }
 
-    // Target banks: if the sequencer is already running, write the STANDBY
-    // bank of each slot and swap - this exercises the live double-buffer +
-    // atomic packet-boundary swap. Otherwise start on bank 0.
-    int target[3];
-    for (int s = 0; s < 3; ++s)
-        target[s] = status.auxSeqEnabled ? (((status.auxBankActive >> s) & 1) ^ 1) : 0;
+    // Target bank for slot 0: if the sweep is already running, write the STANDBY
+    // bank and swap - this exercises the live double-buffer + atomic packet-boundary
+    // swap. Otherwise start on bank 0. Only slot 0 (the program) has a bank.
+    int progBank = status.auxSeqEnabled ? ((status.auxBankActive & 1) ^ 1) : 0;
 
-    // Default slot programs (mirrors remote/net.py):
-    //   slot 0 (cycle 32, real-time): Reg-3 carrier - rewritten by the
-    //           override shadow every packet (digout mirror / fast settle home)
-    //   slot 1 (cycle 33, ADC): accelerometer sweep, one axis per packet
-    //   slot 2 (cycle 34, housekeeping): supply, temp, chip ID, 'INTAN' ROM
-    std::vector<uint16_t> slot0 = { IntanInterface::rhdWrite(3, 0x02) };
-    std::vector<uint16_t> slot1 = { IntanInterface::rhdConvert(32),
-                                    IntanInterface::rhdConvert(33),
-                                    IntanInterface::rhdConvert(34) };
-    std::vector<uint16_t> slot2 = { IntanInterface::rhdConvert(48),
-                                    IntanInterface::rhdConvert(49),
-                                    IntanInterface::rhdRead(63),
-                                    IntanInterface::rhdRead(62),
-                                    IntanInterface::rhdRead(40),
-                                    IntanInterface::rhdRead(41),
-                                    IntanInterface::rhdRead(42),
-                                    IntanInterface::rhdRead(43),
-                                    IntanInterface::rhdRead(44) };
+    // The standard aux config (mirrors remote/net.py aux_demo_setup):
+    //   slot 0 (cycle 32): the accel sweep, one axis per packet -- the ONLY cycling
+    //           slot; its reply pairs intra-packet at data word 34.
+    //   slot 1 (cycle 33): the fs register -- reads the INTAN ROM 'I' (register 40);
+    //           the override whole-replaces it on a fast-settle edge.
+    //   slot 2 (cycle 34): the inject register -- reads the temperature channel;
+    //           injection whole-replaces it on demand.
+    std::vector<uint16_t> sweep  = { IntanInterface::rhdConvert(32),
+                                     IntanInterface::rhdConvert(33),
+                                     IntanInterface::rhdConvert(34) };
+    std::vector<uint16_t> fsReg  = { IntanInterface::rhdRead(40) };    // 'I' of INTAN
+    std::vector<uint16_t> injReg = { IntanInterface::rhdConvert(49) }; // temperature channel
 
-    if (!intanInterface->auxUploadBank(0, target[0], slot0, 0) ||
-        !intanInterface->auxUploadBank(1, target[1], slot1, 0) ||
-        !intanInterface->auxUploadBank(2, target[2], slot2, 0))
+    if (!intanInterface->auxUploadBank(0, progBank, sweep, 0) ||
+        !intanInterface->auxUploadBank(1, 0, fsReg, 0) ||
+        !intanInterface->auxUploadBank(2, 0, injReg, 0))
     {
         LOGE("Aux bank upload failed");
         return false;
     }
 
-    for (int s = 0; s < 3; ++s)
+    // Only slot 0 (the program) has a bank to swap; slots 1 and 2 are registers.
+    if (!intanInterface->auxBankSelect(0, progBank))
     {
-        if (!intanInterface->auxBankSelect(s, target[s]))
-        {
-            LOGE("Aux bank select failed (slot ", s, ", bank ", target[s], ")");
-            return false;
-        }
-    }
-
-    if (!status.auxSeqEnabled && !intanInterface->auxSeqEnable(true))
-    {
-        LOGE("Failed to enable aux sequencer");
+        LOGE("Aux bank select failed (slot 0, bank ", progBank, ")");
         return false;
     }
+
+    // (No enable step: the aux engine is always on -- uploading + selecting the
+    // bank is all that's needed.)
 
     // Reset the de-interleave state for all 4 aux banks to midscale
     for (int b = 0; b < 4; ++b)
@@ -1216,14 +1243,14 @@ bool IntanSocket::setAuxSequencerMode(bool enable)
     auxSeqMode = true;
     if (status.auxSeqEnabled)
     {
-        LOGC("Aux banks reloaded LIVE via standby-bank swap (slots now on banks ",
-             target[0], "/", target[1], "/", target[2], ")");
+        LOGC("Aux accel sweep reloaded LIVE via standby-bank swap (slot 0 now on bank ",
+             progBank, ")");
     }
     else
     {
-        LOGC("Aux sequencer enabled - accel de-interleave mode (10 kHz/axis)");
+        LOGC("Aux accel sweep active - intra-packet de-interleave (10 kHz/axis)");
     }
-    CoreServices::sendStatusMessage("Intan: aux sequencer active");
+    CoreServices::sendStatusMessage("Intan: aux sweep active");
     return true;
 }
 

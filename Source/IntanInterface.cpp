@@ -35,6 +35,9 @@
     #include <sched.h>
     #ifdef __APPLE__
         #include <pthread/qos.h>
+        #include <mach/mach.h>              // real-time (time-constraint) scheduling
+        #include <mach/thread_policy.h>
+        #include <mach/mach_time.h>
     #endif
     #define INVALID_SOCKET -1
     #define SOCKET_ERROR -1
@@ -54,13 +57,7 @@
 // ============================================================================
 
 namespace {
-    constexpr uint32_t CMD_MAGIC = 0xDEADBEEF;
-    // Legacy two-word packet magic {0xDEADBEEF, 0xCAFEBABE}. The UNIFIED format
-    // (docs/unified-packet-format.md) replaces this with a single-word MAGIC in
-    // header word 0 plus a stream_type byte in word 1 (see below). Kept only for
-    // historical reference / the command protocol (CMD_MAGIC is unchanged).
-    constexpr uint32_t PACKET_MAGIC_LOW = 0xDEADBEEF;
-    constexpr uint32_t PACKET_MAGIC_HIGH = 0xCAFEBABE;
+    constexpr uint32_t CMD_MAGIC = 0xDEADBEEF;   // command-protocol magic
 
     // ------------------------------------------------------------------------
     // UNIFIED single-port packet format (matches mz-unified-ports firmware,
@@ -82,7 +79,7 @@ namespace {
 
     constexpr size_t CMD_PACKET_SIZE = 20;
     constexpr size_t ACK_PACKET_SIZE = 3;
-    // Firmware status response has grown over time:
+    // Firmware status response tiers (we require the current full size):
     //   86  bytes  pre-aux firmware
     //   98  bytes  aux-seq-v2 (aux sequencer block)
     //  122  bytes  + DMA/perf instrumentation (fw 1.1.0.0)
@@ -94,18 +91,16 @@ namespace {
     //              wire struct shrank 288 -> 264 B). This plugin decodes only
     //              through rhd_reg[22] (ends at offset 148); the appended
     //              chirp/spike/TX-drop blocks (148..264) are simply ignored.
-    // The buffer must be sized to at least the largest known form, or extra
-    // bytes will sit unread in the TCP queue and corrupt the next command's
-    // ACK. The parser accepts any size >= STATUS_RESPONSE_SIZE_LEGACY and
-    // decodes optional fields based on what the device actually sent, so
-    // newer firmware that grows the response further will still parse — we
-    // just leave the extra headroom empty.
-    constexpr size_t STATUS_RESPONSE_SIZE = 512;   // buffer, with room to grow
-    constexpr size_t STATUS_RESPONSE_SIZE_RHD = 148;
+    // The buffer is oversized so leftover bytes can't sit unread in the TCP queue
+    // and corrupt the next command's ACK. We require the full current status
+    // (STATUS_RESPONSE_SIZE_RHD) and still parse a larger response from newer
+    // firmware (optional blocks are gated by their length threshold); anything
+    // smaller than the current firmware's status is rejected.
+    constexpr size_t STATUS_RESPONSE_SIZE = 512;   // receive buffer, with room to grow
+    constexpr size_t STATUS_RESPONSE_SIZE_RHD = 148;   // the current firmware's status
     constexpr size_t STATUS_RESPONSE_SIZE_AUXCTRL = 126;
     constexpr size_t STATUS_RESPONSE_SIZE_PERF = 122;
     constexpr size_t STATUS_RESPONSE_SIZE_AUX = 98;
-    constexpr size_t STATUS_RESPONSE_SIZE_LEGACY = 86;
 
     // CTRL_REG_AUX_CTRL bit layout (mirrors firmware/include/main.h).
     constexpr uint32_t AUX_CTRL_SEQ_EN              = 1u << 0;
@@ -140,7 +135,7 @@ namespace {
         // mirrors firmware/src-core0/network.c + remote/net.py)
         CMD_AUX_WRITE_WORD = 0x70,   // p1 = slot | bank<<8 | is_len<<16; p2 = addr<<16 | data
         CMD_AUX_BANK_SELECT = 0x71,  // p1 = slot; p2 = bank (confirmed before ACK)
-        CMD_AUX_SEQ_EN = 0x72,       // p1 = 0/1
+        // 0x72 retired (was CMD_AUX_SEQ_EN): the aux command engine is always on
         CMD_READ_REGISTER = 0x73,    // p1 = reg -> 4-byte {cipo1,cipo0} response
         CMD_WRITE_REGISTER = 0x74,   // p1 = reg; p2 = value -> 4-byte echo response
         CMD_SET_FAST_SETTLE = 0x75,  // p1 = amp: sw|gpio_en<<1|pin<<4; p2 = dsp: same layout
@@ -153,10 +148,11 @@ namespace {
     
     // Broadband packet header (UNIFIED format): the 8-word common header PLUS a
     // 6-word broadband sub-block = 14 header words ahead of the data words (the
-    // data words are byte-identical to the legacy stream). See net.py
+    // data words are unchanged by the header reformat). See net.py
     // BB_HEADER_WORDS = 14 and docs/unified-packet-format.md "As implemented".
     //   w0..w7  = common header (above)
-    //   w8      = sub-block: prev-packet slot-2/3 aux echoes (old header w5)
+    //   w8      = sub-block: prev-packet fs/inject-slot aux echoes (the sweep-slot
+    //             echo is in w6[31:16], paired intra-packet with data word 34)
     //   w9..w12 = sub-block: 8 external-ADC breadcrumbs (currently 0)
     //   w13     = sub-block: reserved
     //   w14..   = DATA words
@@ -478,10 +474,10 @@ public:
             return false;
         }
 
-        // Accept any size >= LEGACY (see STATUS_RESPONSE_SIZE comment). The
-        // parser below decodes optional blocks by their length threshold, so
-        // future firmware that grows the response only adds bytes we ignore.
-        if (dataLen < STATUS_RESPONSE_SIZE_LEGACY) {
+        // Require the full current status (see STATUS_RESPONSE_SIZE comment). A
+        // larger response from newer firmware still parses (optional blocks are
+        // gated by length); anything smaller is rejected.
+        if (dataLen < STATUS_RESPONSE_SIZE_RHD) {
             return false;
         }
         
@@ -629,10 +625,6 @@ public:
     bool auxBankSelect(int slot, int bank) {
         // Firmware polls bank_active (up to ~50 ms) before ACKing
         return sendCommand(CMD_AUX_BANK_SELECT, slot & 3, bank & 1);
-    }
-
-    bool auxSeqEnable(bool enable) {
-        return sendCommand(CMD_AUX_SEQ_EN, enable ? 1 : 0);
     }
 
     bool setFastSettle(bool softwareLevel, bool gpioEnable, uint8_t gpioPin,
@@ -1122,7 +1114,41 @@ public:
     // privileged RT classes fall back gracefully if not permitted.
     static void raiseThreadPriority() {
 #if defined(__APPLE__)
-        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+        // Promote to REAL-TIME time-constraint scheduling (CoreAudio's render-thread
+        // mechanism; works unprivileged) so OE's GUI/render threads can't preempt the
+        // socket drain -> kernel UDP overflow -> broadband SEQ gaps that net.py (no GUI)
+        // never shows. CRITICAL: a thread that has a QoS class assigned is system-managed
+        // and thread_policy_set(TIME_CONSTRAINT) is REJECTED on it. std::thread threads
+        // are QOS_CLASS_UNSPECIFIED, so apply time-constraint directly and only fall back
+        // to a QoS class if the kernel refuses. (The prior version set QoS first and the
+        // RT policy silently failed.)
+        kern_return_t kr = KERN_FAILURE;
+        mach_timebase_info_data_t tb;
+        if (mach_timebase_info(&tb) == KERN_SUCCESS && tb.numer != 0) {
+            auto ms_to_abs = [&](double ms) -> uint32_t {
+                return (uint32_t)((ms * 1.0e6) * tb.denom / tb.numer);   // ns -> mach abs
+            };
+            thread_time_constraint_policy_data_t pol;
+            pol.period      = ms_to_abs(1.0);   // eligible to run ~every 1 ms
+            pol.computation = ms_to_abs(0.3);   // guaranteed up to 0.3 ms CPU per period
+            pol.constraint  = ms_to_abs(1.0);   // ...within a 1 ms deadline
+            pol.preemptible = 0;                // don't let a render thread preempt mid-drain
+            kr = thread_policy_set(pthread_mach_thread_np(pthread_self()),
+                                   THREAD_TIME_CONSTRAINT_POLICY,
+                                   (thread_policy_t)&pol,
+                                   THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+        }
+        if (kr != KERN_SUCCESS)
+            pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);   // fallback
+        {
+            // Log ONCE per thread (recv + demux) so it's visible whether RT engaged.
+            static std::atomic<int> rtLogged { 0 };
+            if (rtLogged.fetch_add(1) < 2)
+                std::cout << "[IntanInterface] recv/demux real-time scheduling: "
+                          << (kr == KERN_SUCCESS ? "ENABLED (time-constraint)"
+                                                 : "REJECTED -> QoS fallback")
+                          << " (kr=" << (int)kr << ")" << std::endl;
+        }
 #elif defined(__linux__)
         struct sched_param sp; std::memset(&sp, 0, sizeof(sp));
         sp.sched_priority = sched_get_priority_min(SCHED_FIFO) + 1;
@@ -1211,48 +1237,79 @@ public:
 
         startTime_ = std::chrono::steady_clock::now();
 
+        // Thread-local buffer pools so the recv hot path never mallocs and never locks
+        // per datagram: `spare` = recycled empty buffers to fill, `batch` = filled
+        // datagrams to publish. Refilled from the demux-returned free-list in bulk.
+        std::vector<Datagram> spare;
+        std::vector<Datagram> batch;
+        spare.reserve(kMaxRecvBatch);
+        batch.reserve(kMaxRecvBatch);
+        // Hand back a buffer whose `bytes` is sized to kDatagramCap. Recycled buffers
+        // are already that size, so this resize is a no-op (no zero-fill); only a
+        // freshly default-constructed Datagram pays the one-time grow.
+        auto takeBuf = [&]() -> Datagram {
+            Datagram d;
+            if (!spare.empty()) { d = std::move(spare.back()); spare.pop_back(); }
+            if (d.bytes.size() != kDatagramCap) d.bytes.resize(kDatagramCap);
+            d.len = 0;
+            return d;
+        };
+
         while (running_.load()) {
             struct sockaddr_in senderAddr;
             socklen_t senderLen = sizeof(senderAddr);
 
-            // Reuse a recycled buffer instead of allocating one per packet.
-            std::vector<uint8_t> buffer;
+            // (1) BLOCKING recv for the first datagram of the chunk. SO_RCVTIMEO makes
+            //     this return ~once/sec when idle so we can re-check running_. recvfrom
+            //     into the fixed kDatagramCap buffer; record the length, never resize.
+            Datagram buffer = takeBuf();
+            int received = recvfrom(udpSocket_, reinterpret_cast<char*>(buffer.bytes.data()),
+                                    kDatagramCap, 0,
+                                    reinterpret_cast<struct sockaddr*>(&senderAddr),
+                                    &senderLen);
+            if (received <= 0) {          // timeout / error
+                spare.push_back(std::move(buffer));
+                continue;
+            }
+            buffer.len = (size_t)received;
+            batch.push_back(std::move(buffer));
+
+            // (2) Drain every OTHER datagram already queued in the socket WITHOUT
+            //     blocking -- this is the chunk. After a scheduling gap the whole
+            //     backlog comes out in one pass (catch-up), capped at kMaxRecvBatch.
+            while (batch.size() < kMaxRecvBatch) {
+                Datagram b = takeBuf();
+                int m = recvfrom(udpSocket_, reinterpret_cast<char*>(b.bytes.data()),
+                                 kDatagramCap, MSG_DONTWAIT,
+                                 reinterpret_cast<struct sockaddr*>(&senderAddr),
+                                 &senderLen);
+                if (m <= 0) {             // EAGAIN/EWOULDBLOCK: nothing more queued now
+                    spare.push_back(std::move(b));
+                    break;
+                }
+                b.len = (size_t)m;
+                batch.push_back(std::move(b));
+            }
+
+            // (3) Publish the whole chunk under ONE lock + ONE notify, then top up the
+            //     thread-local spare pool from the demux-returned free-list in bulk.
             {
                 std::lock_guard<std::mutex> lock(ringMutex_);
-                if (!recvFreeList_.empty()) {
-                    buffer = std::move(recvFreeList_.back());
+                for (auto& d : batch) {
+                    if (ring_.size() >= kRingMax) {
+                        ringDrops_++;                                    // host ring overflow
+                        if (spare.size() < kMaxRecvBatch) spare.push_back(std::move(d));
+                    } else {
+                        ring_.push_back(std::move(d));
+                    }
+                }
+                ringCv_.notify_one();
+                while (spare.size() < kMaxRecvBatch && !recvFreeList_.empty()) {
+                    spare.push_back(std::move(recvFreeList_.back()));
                     recvFreeList_.pop_back();
                 }
             }
-            buffer.resize(4096);   // reuses capacity when recycled -> no realloc
-
-            int received = recvfrom(udpSocket_, reinterpret_cast<char*>(buffer.data()),
-                                    buffer.size(), 0,
-                                    reinterpret_cast<struct sockaddr*>(&senderAddr),
-                                    &senderLen);
-
-            if (received <= 0) {
-                // timeout (EAGAIN) or error -> recycle the unused buffer, re-check running_
-                std::lock_guard<std::mutex> lock(ringMutex_);
-                if (recvFreeList_.size() < kFreeListMax)
-                    recvFreeList_.push_back(std::move(buffer));
-                continue;
-            }
-
-            buffer.resize((size_t)received);
-            {
-                std::lock_guard<std::mutex> lock(ringMutex_);
-                if (ring_.size() >= kRingMax) {
-                    // Host-side ring overflow (NOT a board drop). Surface it as
-                    // a reception error so it's never silently hidden.
-                    ringDrops_++;
-                    if (recvFreeList_.size() < kFreeListMax)
-                        recvFreeList_.push_back(std::move(buffer));   // recycle on overflow
-                } else {
-                    ring_.push_back(std::move(buffer));
-                    ringCv_.notify_one();
-                }
-            }
+            batch.clear();
         }
     }
 
@@ -1262,22 +1319,35 @@ public:
         raiseThreadPriority();
         auto lastDropLog = std::chrono::steady_clock::now();
         uint64_t lastRingDrops = 0;
+        std::vector<Datagram> localBatch;   // whole ring drained per wakeup
+        localBatch.reserve(kMaxRecvBatch);
         while (running_.load()) {
-            std::vector<uint8_t> datagram;
             {
                 std::unique_lock<std::mutex> lock(ringMutex_);
                 ringCv_.wait_for(lock, std::chrono::milliseconds(200),
                                  [this] { return !ring_.empty() || !running_.load(); });
-                if (ring_.empty())
-                    continue;
-                datagram = std::move(ring_.front());
-                ring_.pop_front();
+                // Swap out ALL queued datagrams in one shot -- one lock per chunk, not
+                // per datagram.
+                while (!ring_.empty()) {
+                    localBatch.push_back(std::move(ring_.front()));
+                    ring_.pop_front();
+                }
             }
-            demuxDatagram(datagram.data(), datagram.size());
+            if (!localBatch.empty()) {
+                // Decode the chunk OUTSIDE the lock so the recv thread keeps publishing.
+                for (auto& d : localBatch)
+                    demuxDatagram(d.bytes.data(), d.len);
+                // Return the buffers to the free-list in bulk (one lock).
+                std::lock_guard<std::mutex> lock(ringMutex_);
+                for (auto& d : localBatch)
+                    if (recvFreeList_.size() < kFreeListMax)
+                        recvFreeList_.push_back(std::move(d));
+                localBatch.clear();
+            }
             // Surface ring overflow so the drop STAGE is visible: ringDrops_ climbing
-            // == recv->demux ring overflowed == the demux thread couldn't keep up
-            // (the SEQ-gap cause). If SEQ gaps appear but ringDrops_ stays flat, the
-            // loss is downstream (IntanSocket dataQueueDrops_ / OE sourceBuffer).
+            // == recv->demux ring overflowed == the demux couldn't keep up (a SEQ-gap
+            // cause). If SEQ gaps appear but ringDrops_ stays flat, the loss is UPSTREAM
+            // (kernel UDP overflow) or downstream (dataQueueDrops_ / OE sourceBuffer).
             {
                 auto now = std::chrono::steady_clock::now();
                 if (now - lastDropLog > std::chrono::seconds(5)) {
@@ -1294,24 +1364,17 @@ public:
                     }
                 }
             }
-            {
-                // Return the buffer to the free-list so the recv thread can reuse
-                // it without a malloc (keeps the hot recv path allocation-free).
-                std::lock_guard<std::mutex> lock(ringMutex_);
-                if (recvFreeList_.size() < kFreeListMax)
-                    recvFreeList_.push_back(std::move(datagram));
-            }
         }
         // Drain anything still queued at shutdown so we don't silently lose it.
         for (;;) {
-            std::vector<uint8_t> datagram;
+            Datagram datagram;
             {
                 std::lock_guard<std::mutex> lock(ringMutex_);
                 if (ring_.empty()) break;
                 datagram = std::move(ring_.front());
                 ring_.pop_front();
             }
-            demuxDatagram(datagram.data(), datagram.size());
+            demuxDatagram(datagram.bytes.data(), datagram.len);
         }
     }
 
@@ -1415,7 +1478,7 @@ public:
                 // the ring, and causes MORE drops -> a self-amplifying cascade.
                 seqGaps_++;
                 seqLostPackets_ += delta;
-                timestampErrors_++;   // keep the legacy "loss" counter moving too
+                timestampErrors_++;   // keep the timestamp-based loss counter moving too
                 totalErrors_++;
                 static thread_local std::chrono::steady_clock::time_point lastBbLoss{};
                 auto nowTp = std::chrono::steady_clock::now();
@@ -1751,7 +1814,26 @@ public:
     // to ride out a long downstream stall without dropping a datagram; an
     // overflow is counted (ringDrops_) and surfaced, never silently hidden.
     static constexpr size_t kRingMax = 200000;
-    std::deque<std::vector<uint8_t>> ring_;
+    // Max datagrams the recv thread drains per wakeup into ONE locked hand-off, and the
+    // max the demux swaps out per wakeup. macOS has no recvmmsg(), so this MSG_DONTWAIT
+    // drain-into-chunk is the portable analogue of the acq-board's block reads: it
+    // amortizes the per-datagram lock/notify overhead ~256x and lets the recv thread
+    // catch up after a scheduling gap (bigger backlog -> bigger chunk). Tunable.
+    static constexpr size_t kMaxRecvBatch = 256;
+    // One received datagram. `bytes` is kept PERMANENTLY at kDatagramCap so the recv
+    // hot path never re-grows/zero-fills it: the old code did buffer.resize(4096) then
+    // buffer.resize(received) per datagram, so every recycled buffer was re-zeroed
+    // (~3.5 KB) and destruct-walked back down 30k times/s -- a `sample` profile showed
+    // that churn burning ~42% of a core ON THE RECV THREAD, stealing exactly the time
+    // it needed to drain SO_RCVBUF (the kernel UDP overflow that caused the SEQ gaps,
+    // and independent of any GUI load). `len` carries the real payload length that
+    // recvfrom returned, so consumers pass (bytes.data(), len) and never touch size().
+    static constexpr size_t kDatagramCap = 4096;
+    struct Datagram {
+        std::vector<uint8_t> bytes;   // size() stays == kDatagramCap after first use
+        size_t len = 0;               // actual payload length from recvfrom
+    };
+    std::deque<Datagram> ring_;
     std::mutex ringMutex_;
     std::condition_variable ringCv_;
     uint64_t ringDrops_ = 0;
@@ -1760,7 +1842,7 @@ public:
     // matters). demuxThread_ returns each consumed buffer here; recvThread_ reuses
     // it. Guarded by ringMutex_; capped so it can't grow with the ring.
     static constexpr size_t kFreeListMax = 1024;   // ~4 MB of recycled 4 KB buffers
-    std::deque<std::vector<uint8_t>> recvFreeList_;
+    std::deque<Datagram> recvFreeList_;
 
     // State
     uint8_t currentChannelEnable_;
@@ -1890,10 +1972,6 @@ bool IntanInterface::auxUploadBank(int slot, int bank,
 
 bool IntanInterface::auxBankSelect(int slot, int bank) {
     return pImpl_->auxBankSelect(slot, bank);
-}
-
-bool IntanInterface::auxSeqEnable(bool enable) {
-    return pImpl_->auxSeqEnable(enable);
 }
 
 bool IntanInterface::setFastSettle(bool softwareLevel, bool gpioEnable,
@@ -2051,7 +2129,7 @@ std::string IntanInterface::DeviceStatus::getSummary() const {
     if (!hasAuxStatus) {
         oss << "(not supported by this firmware -- 86-byte status)\n";
     } else {
-        oss << "Enabled: " << (auxSeqEnabled ? "YES" : "no")
+        oss << "Engine: " << (auxSeqEnabled ? "on" : "OFF?")
             << "  Fast settle: " << (fastSettleActive ? "ACTIVE" : "off")
             << "  Digout: " << (digoutState ? "1" : "0")
             << "  DSP reset: " << (dspResetActive ? "ACTIVE" : "off") << "\n";

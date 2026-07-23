@@ -125,11 +125,10 @@ private:
     // Aux sequencer test tooling (all usable DURING acquisition)
     std::unique_ptr<UtilityButton> statusButton;      // print device status to console
     std::unique_ptr<UtilityButton> fastSettleButton;  // toggle software fast settle
-    std::unique_ptr<UtilityButton> auxModeButton;     // toggle banked-aux/accel mode
     bool fastSettleActive;
-    bool auxModeActive;
 
-    /** Refresh the tooling buttons' labels/colors from node state */
+    /** Refresh the fast-settle button label/color from node state. The accel
+        sweep is now always-on (the board boots into it) so it has no toggle. */
     void refreshAuxButtons();
     
     // UI components

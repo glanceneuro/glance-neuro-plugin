@@ -8,6 +8,7 @@
 #include "IntanInterface.h"
 #include <memory>
 #include <mutex>
+#include <condition_variable>
 #include <queue>
 
 namespace IntanSocketNode
@@ -186,12 +187,29 @@ private:
     };
     std::queue<DataPacket> dataQueue;
     std::mutex queueMutex;
+    // Signalled by the producer (processDataPacket) when a packet is queued, so the
+    // OpenEphys DataThread can BLOCK in updateBuffer() instead of spinning. The base
+    // DataThread::run() calls updateBuffer() in a tight no-sleep loop; returning
+    // immediately on an empty queue burns a whole CPU core (that self-inflicted load
+    // is what starves the recv/kernel path -- net.py, which blocks on recv, uses ~1/4
+    // the CPU this plugin did).
+    std::condition_variable queueCv_;
     // Bounded safety valve: dataQueue was unbounded, so if the Open Ephys consumer
     // ever fell behind it grew without limit -> memory bloat -> allocator latency
     // -> recv/demux stalls -> kernel UDP drops (SEQ gaps) after minutes. Cap it and
     // drop-oldest with a counter instead. ~4 s of headroom at 30 kHz.
     static constexpr size_t kMaxDataQueue = 120000;
     std::atomic<uint64_t> dataQueueDrops_ { 0 };
+
+    // Recycle DataPacket word-buffers instead of malloc/free per packet. At 30 kHz a
+    // fresh vector alloc in processDataPacket + free when the packet is consumed churns
+    // the allocator -> latency drift -> recv/demux stall -> kernel UDP drops (SEQ gaps),
+    // exactly what the allocation-free recv/demux path is designed to avoid. Producer
+    // (processDataPacket) pulls a buffer from here and refills it via assign() (reuses
+    // capacity); consumer (updateBuffer) returns each drained buffer here. Move-only,
+    // guarded by queueMutex (same lock as dataQueue, so no extra locking).
+    std::vector<std::vector<uint32_t>> bufferPool_;
+    static constexpr size_t kBufferPoolMax = 1024;
     
     /** Buffers for conversion */
     std::vector<float> convbuf;
@@ -207,7 +225,7 @@ private:
     bool debugMode;
 
     /** Aux sequencer tooling state */
-    bool auxSeqMode = false;       // banked aux programs active
+    bool auxSeqMode = true;        // accel sweep active (the board boots into it)
     bool fastSettleSw = false;     // software fast-settle level
     int fastSettleTTL = -1;        // digital_in pin for fast settle (-1 = off)
 

@@ -251,18 +251,9 @@ IntanSocketEditor::IntanSocketEditor(GenericProcessor* parentNode, IntanSocket* 
     addAndMakeVisible(fastSettleButton.get());
     fastSettleButton->setEnabledState(false);
 
-    auxModeButton = std::make_unique<UtilityButton>("AUX SEQ");
-    auxModeButton->setFont(FontOptions("Small Text", 12, Font::bold));
-    auxModeButton->setRadius(3.0f);
-    auxModeButton->setBounds(345, 78, 72, 18);
-    auxModeButton->addListener(this);
-    auxModeButton->setTooltip("Banked aux mode: accel sweep (1 axis/packet, echo de-interleave). "
-                              "Toggling while acquiring exercises the live standby-bank swap");
-    addAndMakeVisible(auxModeButton.get());
-    auxModeButton->setEnabledState(false);
-
     fastSettleActive = false;
-    auxModeActive = false;
+    // The accelerometer sweep is always on -- the board boots into it and the
+    // plugin de-interleaves it unconditionally -- so there is no aux-mode toggle.
 
     // Sample rate interface
     sampleRateInterface = std::make_unique<SampleRateInterface>(node);
@@ -372,15 +363,6 @@ void IntanSocketEditor::buttonClicked(Button* button)
         node->setManualFastSettle(fastSettleActive);
         refreshAuxButtons();
     }
-    else if (button == auxModeButton.get())
-    {
-        // Works during acquisition by design: toggling while streaming
-        // uploads the STANDBY banks and swaps them live.
-        bool target = !auxModeActive;
-        if (node->setAuxSequencerMode(target))
-            auxModeActive = target;
-        refreshAuxButtons();
-    }
     else if ((button == debugMode1PButton.get() || button == debugMode2PButton.get())
              && !acquisitionIsActive)
     {
@@ -451,7 +433,6 @@ void IntanSocketEditor::refreshAuxButtons()
     // Pull authoritative state from the node (it may have auto-enabled the
     // sequencer for fast settle, or synced state on reconnect)
     fastSettleActive = node->isFastSettleOn();
-    auxModeActive = node->isAuxSequencerMode();
 
     if (fastSettleActive)
     {
@@ -464,18 +445,6 @@ void IntanSocketEditor::refreshAuxButtons()
         fastSettleButton->setColour(TextButton::buttonColourId,
                                     findColour(TextButton::buttonColourId));
     }
-
-    if (auxModeActive)
-    {
-        auxModeButton->setLabel("AUX: ON");
-        auxModeButton->setColour(TextButton::buttonColourId, Colours::orange.darker(0.3f));
-    }
-    else
-    {
-        auxModeButton->setLabel("AUX SEQ");
-        auxModeButton->setColour(TextButton::buttonColourId,
-                                 findColour(TextButton::buttonColourId));
-    }
 }
 
 void IntanSocketEditor::connected()
@@ -487,7 +456,6 @@ void IntanSocketEditor::connected()
     debugMode2PButton->setVisible(true);
     statusButton->setEnabledState(true);
     fastSettleButton->setEnabledState(true);
-    auxModeButton->setEnabledState(true);
     refreshAuxButtons();   // sync with device state (persists across reconnect)
 
     // Pull the TTL fast-settle pin from the device (aux_ctrl readback,
@@ -512,7 +480,6 @@ void IntanSocketEditor::disconnected()
     debugMode2PButton->setVisible(true);
     statusButton->setEnabledState(false);
     fastSettleButton->setEnabledState(false);
-    auxModeButton->setEnabledState(false);
 
     // TTL Settle combo: disable while disconnected and reset to "-" so a
     // future reconnect can't silently re-enable the TTL trigger on a freshly

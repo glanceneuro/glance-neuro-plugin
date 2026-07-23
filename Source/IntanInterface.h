@@ -103,7 +103,7 @@ public:
         // status response). hasAuxStatus is false when talking to older
         // 86-byte firmware -- the fields below are then all zero.
         bool hasAuxStatus;
-        bool auxSeqEnabled;       // per-packet latched aux_seq_en
+        bool auxSeqEnabled;       // aux engine active (always true; aux-default)
         bool fastSettleActive;    // live RHD Reg-0 D5 state
         bool digoutState;         // live auxout mirror bit
         bool dspResetActive;      // CONVERT bit-H forcing active
@@ -528,9 +528,10 @@ public:
     /**
      * @brief Upload a command program (and its length record) into one bank.
      *
-     * @param slot 0..2 (slot 0 -> COPI cycle 32, real-time control;
-     *             slot 1 -> cycle 33, ADC/accelerometer;
-     *             slot 2 -> cycle 34, config/housekeeping)
+     * @param slot 0..2 (slot 0 -> COPI cycle 32, real-time control register;
+     *             slot 1 -> cycle 33, ADC/accelerometer cycling program;
+     *             slot 2 -> cycle 34, one-shot inject register). Only slot 1
+     *             is a true program with banks; slots 0/2 are single registers.
      * @param bank 0 or 1 (write the STANDBY bank while the other plays)
      * @param commands 1..64 RHD command words
      * @param loopIndex index the program wraps back to (entries before it
@@ -545,9 +546,6 @@ public:
      * The firmware polls bank_active and only ACKs once the swap landed.
      */
     bool auxBankSelect(int slot, int bank);
-
-    /** @brief Enable/disable the aux command sequencer (default off). */
-    bool auxSeqEnable(bool enable);
 
     /**
      * @brief Configure amplifier fast settle (RHD Reg-0 D5).
@@ -609,7 +607,7 @@ public:
      * 
      * Packet size depends on channel enable setting (UNIFIED broadband format):
      * - Header: 14 words (8-word common header + 6-word broadband sub-block)
-     * - Data: variable based on enabled channels (byte-identical to legacy)
+     * - Data: variable based on enabled channels (unchanged by the header reformat)
      * 
      * @param channelMask Channel enable mask (0x0-0xF)
      * @return Expected packet size in 32-bit words
