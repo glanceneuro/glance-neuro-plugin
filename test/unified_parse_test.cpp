@@ -8,7 +8,7 @@
 // Source/IntanInterface.cpp (demuxDatagram / validateAndDispatchPacket /
 // processLfpDatagram) and Source/IntanSocket.cpp (updateBuffer header offsets)
 // use for the UNIFIED single-port format, and asserts it against synthetic
-// packets built to the spec in mz-unified-ports docs/unified-packet-format.md.
+// packets built to the spec in the glance-neuro repo's docs/unified-packet-format.md.
 //
 // Goal: prove the plugin's demux + per-stream SEQ-gap detection + header field
 // offsets match the firmware byte-for-byte (the same bytes net.py's UnifiedSink
