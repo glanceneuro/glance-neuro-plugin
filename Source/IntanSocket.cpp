@@ -181,6 +181,15 @@ bool IntanSocket::connectDevice(bool printOutput)
             }
         );
 
+        // LFP callback: each frame is one decimated sample across all enabled
+        // LFP channels. Always wired -- silently does nothing until the LFP
+        // engine is enabled in the firmware.
+        intanInterface->setLfpDataCallback(
+            [this](const IntanInterface::LfpFrame& f) {
+                processLfpFrame(f);
+            }
+        );
+
         // Set up error callback
         intanInterface->setErrorCallback(
             [this, printOutput](const std::string& error) {
@@ -251,6 +260,12 @@ bool IntanSocket::connectDevice(bool printOutput)
         // The board boots into the accel sweep (slot 0 cycles CONVERT 32->33->34) and
         // the de-interleave always runs in sweep form -- there is no alternate mode.
         // auxSeqMode is just a local UI-state flag; it stays true from connect on.
+
+        // LFP/DSP engine state -- mirror whatever the device reports. There is
+        // nothing to validate or repair here: the filters are loaded from the
+        // bitstream at boot and the decimation is structural, so any state the
+        // firmware reports is a state it can actually stream in.
+        applyLfpStatus(status);
 
         // Fast-settle / TTL state: prefer the new aux_ctrl readback
         // (firmware 65d5fb5+) which surfaces the actual SW level and TTL
@@ -326,8 +341,10 @@ void IntanSocket::updateSettings(OwnedArray<ContinuousChannel>* continuousChanne
     bool generatesTimestamps = true;
 
     DataStream::Settings dataStreamSettings{
-        "IntanStream",
-        "Data from Intan neural interface",
+        // Open Ephys appends its own "-A"/"-B" suffix per stream, so keep the
+        // base name descriptive of the CONTENT rather than the device.
+        "BroadbandStream",
+        "Broadband 30 kHz amplifier data",
         "intan.data",
         SAMPLE_RATE,
         generatesTimestamps
@@ -457,6 +474,76 @@ void IntanSocket::updateSettings(OwnedArray<ContinuousChannel>* continuousChanne
     eventChannels->add (new EventChannel (settings));
 
     LOGC("Configured ", n_neural_channels, " channels");
+
+    // ------------------------------------------------------------------
+    // SECOND DATASTREAM: decimated LFP band (firmware LFP engine).
+    // Created only when the engine is enabled in the firmware at connect-
+    // time. Sample rate = SAMPLE_RATE / lfp_decim_R; channel count = popcount
+    // of the LFP lane mask * 32 (amplifier channels only -- no aux). The
+    // user configures + enables the engine via an out-of-band tool (e.g.
+    // net.py configure_lfp), then reconnects the plugin to publish the
+    // stream into Open Ephys.
+    //
+    // (Pattern follows the Neuropixels plugin's AP / LFP stream pairing:
+    //  one DataStream per band, parallel sourceBuffers index.)
+    // ------------------------------------------------------------------
+    if (lfp_enabled && lfp_num_channels > 0 && lfp_decim_R > 0)
+    {
+        float lfpSampleRate = SAMPLE_RATE / (float)lfp_decim_R;
+
+        DataStream::Settings lfpSettings{
+            "LFPStream",
+            "Decimated LFP band",
+            "intan.data.lfp",
+            lfpSampleRate,
+            generatesTimestamps
+        };
+        DataStream* lfpStream = new DataStream(lfpSettings);
+        sourceStreams->add(lfpStream);
+
+        // sourceBuffers is owned by the plugin (not auto-managed by OE) and
+        // the constructor only creates [0] for the broadband stream. Add the
+        // LFP buffer on first connect with LFP enabled; resize on subsequent
+        // reconnects when the channel count / rate might have changed.
+        int lfpBufferSamples = (int)(lfpSampleRate * bufferSizeInSeconds);
+        if (sourceBuffers.size() < 2) {
+            sourceBuffers.add(new DataBuffer(lfp_num_channels, lfpBufferSamples));
+        } else {
+            sourceBuffers[1]->resize(lfp_num_channels, lfpBufferSamples);
+        }
+
+        // Channel naming mirrors the broadband layout but with an LFP_
+        // prefix: LFP_A_CH1.., LFP_B_CH1.. Lane order follows the same
+        // bit-order packing the firmware uses (low->high bit, A then B).
+        int portA_idx = 0;
+        int portB_idx = 0;
+        for (int b = 0; b < 8; ++b)
+        {
+            if ((lfp_lane_mask & (1 << b)) == 0)
+                continue;
+            String portPrefix = (b < 4) ? "LFP_A_" : "LFP_B_";
+            for (int k = 0; k < 32; ++k)
+            {
+                int chanNum = (b < 4) ? ++portA_idx : ++portB_idx;
+                ContinuousChannel::Settings ls{
+                    ContinuousChannel::Type::ELECTRODE,
+                    portPrefix + "CH" + String(chanNum),
+                    "Intan LFP-band neural data channel",
+                    "intan.continuous.lfp",
+                    data_scale,                  // same 0.195 µV/LSB as broadband
+                    lfpStream
+                };
+                continuousChannels->add(new ContinuousChannel(ls));
+                continuousChannels->getLast()->setUnits("uV");
+            }
+        }
+
+        LOGC("Configured LFP stream: ", lfp_num_channels, " channels @ ",
+             (int)lfpSampleRate, " Hz (mask=0x",
+             String::toHexString((int)lfp_lane_mask),
+             ", decim=", (int)lfp_decim_R,
+             ", taps=", (int)lfp_num_taps, ")");
+    }
 }
 
 bool IntanSocket::foundInputSource()
@@ -616,6 +703,37 @@ void IntanSocket::processDataPacket(const uint32_t* data, size_t wordCount, uint
     dataQueue.push(std::move(packet));   // move, not copy
     lock.unlock();
     queueCv_.notify_one();               // wake the (blocked) DataThread
+}
+
+void IntanSocket::processLfpFrame(const IntanInterface::LfpFrame& frame)
+{
+    // Called from IntanInterface's LFP listener thread. If no second
+    // DataStream was published (LFP wasn't enabled at connect time), there's
+    // no sourceBuffers[1] to push into -- silently drop.
+    if (!lfp_enabled || lfp_num_channels <= 0) return;
+    if (sourceBuffers.size() < 2) return;
+    if ((int)frame.sampleCount != lfp_num_channels) return;  // mask/cfg drift
+
+    // Convert offset-binary uint16 -> signed float in uV, matching broadband
+    // scaling. One time sample across all channels per frame.
+    if ((int)lfpConvBuf.size() != lfp_num_channels)
+        lfpConvBuf.resize(lfp_num_channels);
+
+    for (int ch = 0; ch < lfp_num_channels; ++ch)
+        lfpConvBuf[ch] = (float)((int)frame.samples[ch] - 32768) * data_scale;
+
+    // Use the frame's timestamp (= frame_seq * decim_R, in broadband ticks --
+    // aligns with the broadband stream). One TTL event word per sample;
+    // we don't have a per-frame digital_in latch on the LFP path, so keep
+    // it constant at eventState (no transitions on this stream).
+    int64 lfpSampleNumber = (int64)frame.frameSequence;
+    double lfpTimestamp = (double)frame.timestamp;
+
+    sourceBuffers[1]->addToBuffer(lfpConvBuf.data(),
+                                  &lfpSampleNumber,
+                                  &lfpTimestamp,
+                                  &eventState,
+                                  1);  // ONE time sample
 }
 
 bool IntanSocket::updateBuffer()
@@ -902,6 +1020,35 @@ bool IntanSocket::runAutoDetection(IntanInterface::AutoDetectionResult& result, 
     return success;
 }
 
+// Adopt the firmware's LFP geometry. The frame consumer drops any frame whose
+// sampleCount disagrees with lfp_num_channels, so every path that can change the
+// board's lane mask must come through here -- otherwise the stale count silently
+// discards the entire stream and the LFP band reads as zeros rather than as an
+// error. The lane mask mirrors the broadband channel-enable on the board, which
+// is why auto-detection changes it too.
+void IntanSocket::applyLfpStatus(const IntanInterface::DeviceStatus& s)
+{
+    if (s.hasLfpStatus && s.lfpEnabled && s.lfpLaneMask != 0 && s.lfpDecimR != 0)
+    {
+        lfp_enabled   = true;
+        lfp_lane_mask = s.lfpLaneMask;
+        lfp_decim_R   = s.lfpDecimR;
+        lfp_num_taps  = s.lfpNumTaps;
+        int popcount = 0;
+        for (int b = 0; b < 8; ++b)
+            popcount += ((lfp_lane_mask >> b) & 1);
+        lfp_num_channels = popcount * 32;
+    }
+    else
+    {
+        lfp_enabled      = false;
+        lfp_lane_mask    = 0;
+        lfp_decim_R      = 0;
+        lfp_num_taps     = 0;
+        lfp_num_channels = 0;
+    }
+}
+
 bool IntanSocket::applyDetectionConfig(const IntanInterface::AutoDetectionResult& result)
 {
     if (!intanInterface || !result.success)
@@ -919,9 +1066,20 @@ bool IntanSocket::applyDetectionConfig(const IntanInterface::AutoDetectionResult
     // Update local channel enable state
     channel_enable_mask = result.optimalChannelMask;
     num_channels = calculateNumChannels(channel_enable_mask);
-    
-    LOGC("Applied detection config - ", num_channels, " channels enabled");
-    
+
+    // The board derives the LFP lane mask from the broadband channel-enable we
+    // just changed, so the LFP frames are now a different size. Re-read the
+    // geometry before the signal chain is rebuilt: leaving it stale makes the
+    // frame consumer reject every frame as drift, and the LFP band goes silently
+    // to zero until the engine is toggled off and on.
+    IntanInterface::DeviceStatus s;
+    if (intanInterface->getStatus(s))
+        applyLfpStatus(s);
+
+    LOGC("Applied detection config - ", num_channels, " channels enabled",
+         lfp_enabled ? String(", LFP ") + String(lfp_num_channels) + " ch"
+                     : String(", LFP off"));
+
     return true;
 }
 void IntanSocket::setDebugMode(bool enable, uint8_t mask)
@@ -1254,3 +1412,60 @@ bool IntanSocket::setAuxSequencerMode(bool enable)
     return true;
 }
 
+
+bool IntanSocket::setLfpEnabled(bool enable)
+{
+    if (!intanInterface || !intanInterface->foundInputSource())
+    {
+        LOGE("LFP: device not connected");
+        return false;
+    }
+
+    // Enabling is all that is needed: the board boots with both filters of the
+    // decimation cascade already loaded, so there is nothing to configure. The
+    // plugin must NOT push coefficients here -- the filters are generated by
+    // programmable_logic/sim/design_lfp_filters.py, and re-deriving them in the
+    // plugin would let the two drift apart. Changing the filter (linear vs
+    // minimum phase) is done from remote/net.py. See docs/lfp.md.
+    if (enable)
+    {
+        IntanInterface::DeviceStatus s;
+        if (!intanInterface->getStatus(s))
+        {
+            LOGE("LFP: status read failed before enable");
+            return false;
+        }
+        if (!s.hasLfpStatus)
+        {
+            LOGE("LFP: this firmware does not expose the LFP engine");
+            CoreServices::sendStatusMessage("Intan: firmware lacks LFP engine");
+            return false;
+        }
+    }
+
+    if (!intanInterface->lfpEnable(enable))
+    {
+        LOGE("LFP: ", enable ? "enable" : "disable", " command failed");
+        return false;
+    }
+
+    // Re-read status so our local LFP state (which gates the second
+    // DataStream in updateSettings) reflects the new firmware state.
+    IntanInterface::DeviceStatus s;
+    if (intanInterface->getStatus(s))
+    {
+        applyLfpStatus(s);
+        if (lfp_enabled)
+        {
+            LOGC("LFP enabled - ", lfp_num_channels, " channels @ ",
+                 (int)(SAMPLE_RATE / lfp_decim_R), " Hz");
+            CoreServices::sendStatusMessage("Intan: LFP stream ON");
+        }
+        else
+        {
+            LOGC("LFP disabled");
+            CoreServices::sendStatusMessage("Intan: LFP stream off");
+        }
+    }
+    return true;
+}

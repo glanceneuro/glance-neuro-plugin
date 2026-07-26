@@ -51,6 +51,16 @@ public:
     uint8_t channel_enable_mask;
     int num_channels;
 
+    // LFP/DSP engine state, mirrored from the device at connect-time. The
+    // second DataStream / sourceBuffer is built from these values; if
+    // lfp_enabled is false at connect, no second stream is published (the
+    // user enables it from net.py / external tool and reconnects).
+    bool    lfp_enabled = false;
+    uint8_t lfp_lane_mask = 0;
+    uint8_t lfp_decim_R = 0;
+    uint8_t lfp_num_taps = 0;
+    int     lfp_num_channels = 0;   // popcount(lfp_lane_mask) * 32
+
     /** Constructor */
     IntanSocket(SourceNode* sn);
 
@@ -133,6 +143,27 @@ public:
     bool setAuxSequencerMode(bool enable);
     bool isAuxSequencerMode() const { return auxSeqMode; }
 
+    /** Enable / disable the firmware's LFP/DSP engine. LFP frames arrive on
+        the SAME unified UDP port as broadband (stream_type=2), at 3 kHz.
+
+        Enabling is all that is required: the board boots with both filters of
+        the decimation cascade loaded, so the plugin never uploads coefficients
+        (that would duplicate the design that generates them and be free to
+        drift). Swap the stage-2 filter from remote/net.py if you need minimum
+        phase instead of linear phase.
+
+        Caller is expected to invoke CoreServices::updateSignalChain afterwards
+        so the stream-count change takes effect in OE. */
+    bool setLfpEnabled(bool enable);
+
+    /** Adopt the firmware's LFP geometry (lane mask, decimation, channel count).
+        The incoming frame's sample count is checked against lfp_num_channels, so
+        anything that changes the board's lane mask must refresh this or every
+        frame is dropped as drift. Call it from EVERY path that can change the
+        mask -- connect, LFP enable, and auto-detection. */
+    void applyLfpStatus(const IntanInterface::DeviceStatus& s);
+    bool isLfpEnabled() const { return lfp_enabled; }
+
 private:
     const int bufferSizeInSeconds = 10;
     
@@ -149,6 +180,11 @@ private:
 
     /** Converts Intan data packet to Open Ephys format */
     void processDataPacket(const uint32_t* data, size_t wordCount, uint64_t timestamp);
+
+    /** Pushes one LFP frame (from the IntanInterface LFP listener) into
+        sourceBuffers[1]. Each frame is one decimated sample per channel
+        across `popcount(lane_mask) * 32` LFP channels. */
+    void processLfpFrame(const IntanInterface::LfpFrame& frame);
 
     /** Number of enabled 16-bit data streams in the 8-bit mask.
         Bits 0-3 = port A (A_CIPO0_REG, A_CIPO0_DDR, A_CIPO1_REG, A_CIPO1_DDR);
@@ -213,6 +249,7 @@ private:
     
     /** Buffers for conversion */
     std::vector<float> convbuf;
+    std::vector<float> lfpConvBuf;
     
     /** Sample counter */
     int64 totalSamples;

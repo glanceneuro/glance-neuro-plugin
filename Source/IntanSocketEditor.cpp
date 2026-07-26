@@ -255,6 +255,21 @@ IntanSocketEditor::IntanSocketEditor(GenericProcessor* parentNode, IntanSocket* 
     // The accelerometer sweep is always on -- the board boots into it and the
     // plugin de-interleaves it unconditionally -- so there is no aux-mode toggle.
 
+    lfpEnableButton = std::make_unique<UtilityButton>("LFP");
+    lfpEnableButton->setFont(FontOptions("Small Text", 12, Font::bold));
+    lfpEnableButton->setRadius(3.0f);
+    lfpEnableButton->setBounds(345, 103, 72, 18);
+    lfpEnableButton->addListener(this);
+    lfpEnableButton->setTooltip("Toggle the firmware LFP/DSP engine. LFP frames arrive on "
+                                "the SAME unified UDP port as broadband (default 0x6800), "
+                                "tagged stream_type=2. Filter design and channel mask are "
+                                "set out-of-band -- run remote/net.py configure_lfp(...) "
+                                "FIRST, then enable here. Toggling re-runs updateSettings.");
+    addAndMakeVisible(lfpEnableButton.get());
+    lfpEnableButton->setEnabledState(false);
+
+    lfpActive = false;
+
     // Sample rate interface
     sampleRateInterface = std::make_unique<SampleRateInterface>(node);
     sampleRateInterface->setBounds(80, 22, 80, 50);
@@ -303,6 +318,8 @@ void IntanSocketEditor::startAcquisition()
     disconnectButton->setAlpha(0.2f);
     debugMode1PButton->setEnabledState(false);
     debugMode2PButton->setEnabledState(false);
+    // LFP toggle would change the source-stream count -> unsafe mid-acquisition
+    lfpEnableButton->setEnabledState(false);
 }
 
 void IntanSocketEditor::stopAcquisition()
@@ -317,6 +334,7 @@ void IntanSocketEditor::stopAcquisition()
     disconnectButton->setAlpha(1.0f);
     debugMode1PButton->setEnabledState(true);
     debugMode2PButton->setEnabledState(true);
+    lfpEnableButton->setEnabledState(true);
 }
 
 void IntanSocketEditor::buttonClicked(Button* button)
@@ -361,6 +379,20 @@ void IntanSocketEditor::buttonClicked(Button* button)
         // Works during acquisition by design (that is the point of settle)
         fastSettleActive = !fastSettleActive;
         node->setManualFastSettle(fastSettleActive);
+        refreshAuxButtons();
+    }
+    else if (button == lfpEnableButton.get() && !acquisitionIsActive)
+    {
+        // Stream count changes -> needs an updateSignalChain afterwards so OE
+        // rebuilds the signal chain with / without the second DataStream.
+        // Restricted to !acquisition because adding a stream mid-acquisition
+        // would invalidate downstream node settings.
+        bool target = !lfpActive;
+        if (node->setLfpEnabled(target))
+        {
+            lfpActive = target;
+            CoreServices::updateSignalChain(this);
+        }
         refreshAuxButtons();
     }
     else if ((button == debugMode1PButton.get() || button == debugMode2PButton.get())
@@ -445,6 +477,20 @@ void IntanSocketEditor::refreshAuxButtons()
         fastSettleButton->setColour(TextButton::buttonColourId,
                                     findColour(TextButton::buttonColourId));
     }
+
+    lfpActive = node->isLfpEnabled();
+    if (lfpActive)
+    {
+        lfpEnableButton->setLabel("LFP: ON");
+        lfpEnableButton->setColour(TextButton::buttonColourId,
+                                   Colours::green.darker(0.3f));
+    }
+    else
+    {
+        lfpEnableButton->setLabel("LFP");
+        lfpEnableButton->setColour(TextButton::buttonColourId,
+                                   findColour(TextButton::buttonColourId));
+    }
 }
 
 void IntanSocketEditor::connected()
@@ -456,6 +502,7 @@ void IntanSocketEditor::connected()
     debugMode2PButton->setVisible(true);
     statusButton->setEnabledState(true);
     fastSettleButton->setEnabledState(true);
+    lfpEnableButton->setEnabledState(true);
     refreshAuxButtons();   // sync with device state (persists across reconnect)
 
     // Pull the TTL fast-settle pin from the device (aux_ctrl readback,
@@ -480,6 +527,7 @@ void IntanSocketEditor::disconnected()
     debugMode2PButton->setVisible(true);
     statusButton->setEnabledState(false);
     fastSettleButton->setEnabledState(false);
+    lfpEnableButton->setEnabledState(false);
 
     // TTL Settle combo: disable while disconnected and reset to "-" so a
     // future reconnect can't silently re-enable the TTL trigger on a freshly

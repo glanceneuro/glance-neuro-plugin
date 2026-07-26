@@ -76,6 +76,8 @@ namespace {
     constexpr uint8_t  UNIFIED_VERSION        = 1;
     constexpr size_t   COMMON_HEADER_WORDS    = 8;   // the 8 shared header words
     constexpr uint8_t  STREAM_TYPE_BROADBAND  = 1;
+    constexpr uint8_t  STREAM_TYPE_LFP        = 2;
+    constexpr uint8_t  STREAM_TYPE_WAVELET    = 3;   // reserved (follow-on branch)
 
     constexpr size_t CMD_PACKET_SIZE = 20;
     constexpr size_t ACK_PACKET_SIZE = 3;
@@ -85,19 +87,17 @@ namespace {
     //  122  bytes  + DMA/perf instrumentation (fw 1.1.0.0)
     //  126  bytes  + aux_ctrl (CTRL_REG_22 readback)        -- 65d5fb5
     //  148  bytes  + rhd_reg[22] mirror (commanded chip cfg) -- 7fb41dc
-    //  264  bytes  BROADBAND-ONLY firmware (fw 1.8): + chirp NCO, recv->transmit
-    //              spike stats, TX drop diagnostics. This build has NO on-PL LFP
-    //              producer, so the old LFP engine status fields are gone (the
-    //              wire struct shrank 288 -> 264 B). This plugin decodes only
-    //              through rhd_reg[22] (ends at offset 148); the appended
-    //              chirp/spike/TX-drop blocks (148..264) are simply ignored.
-    // The buffer is oversized so leftover bytes can't sit unread in the TCP queue
-    // and corrupt the next command's ACK. We require the full current status
-    // (STATUS_RESPONSE_SIZE_RHD) and still parse a larger response from newer
-    // firmware (optional blocks are gated by their length threshold); anything
-    // smaller than the current firmware's status is rejected.
-    constexpr size_t STATUS_RESPONSE_SIZE = 512;   // receive buffer, with room to grow
-    constexpr size_t STATUS_RESPONSE_SIZE_RHD = 148;   // the current firmware's status
+    //  160  bytes  + LFP/DSP engine config + status (re-added with the on-PL engine)
+    //  288  bytes  + chirp NCO, recv->transmit spike stats, TX drop diagnostics
+    // 288 B is the current aux + LFP firmware (fw 2.1.0.0). Optional blocks are
+    // gated by their offset threshold, so the parser accepts any response >= the
+    // minimum (rhd_reg at 148) and decodes what the device actually sent. This
+    // plugin reads through the LFP config block (160); the appended chirp / spike /
+    // TX-drop tail (160..288) is left unread. The buffer is oversized so leftover
+    // bytes can't sit in the TCP queue and corrupt the next command's ACK.
+    constexpr size_t STATUS_RESPONSE_SIZE = 512;       // receive buffer, with room to grow
+    constexpr size_t STATUS_RESPONSE_SIZE_LFP = 160;   // through the LFP engine config block
+    constexpr size_t STATUS_RESPONSE_SIZE_RHD = 148;   // through rhd_reg[22] (minimum accepted)
     constexpr size_t STATUS_RESPONSE_SIZE_AUXCTRL = 126;
     constexpr size_t STATUS_RESPONSE_SIZE_PERF = 122;
     constexpr size_t STATUS_RESPONSE_SIZE_AUX = 98;
@@ -139,7 +139,12 @@ namespace {
         CMD_READ_REGISTER = 0x73,    // p1 = reg -> 4-byte {cipo1,cipo0} response
         CMD_WRITE_REGISTER = 0x74,   // p1 = reg; p2 = value -> 4-byte echo response
         CMD_SET_FAST_SETTLE = 0x75,  // p1 = amp: sw|gpio_en<<1|pin<<4; p2 = dsp: same layout
-        CMD_SET_DIGOUT = 0x76        // p1 = sw|gpio_en<<1|pin<<4; p2 = reg3_static byte
+        CMD_SET_DIGOUT = 0x76,       // p1 = sw|gpio_en<<1|pin<<4; p2 = reg3_static byte
+        // LFP/DSP engine (firmware 0e99881 / fw >= 1.2)
+        CMD_LFP_ENABLE = 0x80,       // p1 = 0/1
+        CMD_LFP_SET_PARAMS = 0x81,   // p1 ignored (decimation is structural), p2 = num_taps
+        CMD_LFP_SET_CHANNELS = 0x82, // p1 = 8-bit lane mask
+        CMD_LFP_WRITE_COEF = 0x83    // p1 bit0 = clear-ptr-first, bit1 = stage (0=halfband,1=decimator); p2 = 18-bit signed coef
     };
     
     // ACK status codes
@@ -287,12 +292,12 @@ public:
         autoConfigureUdp();
 
         // Start the UNIFIED UDP listener: ONE socket on udpPort_ (0x6800) carries
-        // the broadband stream, demuxed by stream_type. Two threads:
+        // ALL streams (broadband + LFP), demuxed by stream_type. Two threads:
         //   * recvThread_  -- the hot path: recvfrom -> ring, nothing else, so
         //                     broadband is NEVER blocked while a slow consumer
         //                     processes a packet (the no-loss drain rule).
         //   * demuxThread_ -- pops the ring, peeks stream_type, routes broadband
-        //                     to the data callback.
+        //                     to the data callback and LFP to the LFP callback.
         running_ = true;
         recvThread_  = std::thread(&Impl::udpRecvThread, this);
         demuxThread_ = std::thread(&Impl::udpDemuxThread, this);
@@ -588,11 +593,24 @@ public:
             status.hasRhdRegMirror = true;
         }
 
-        // The broadband-only firmware appends chirp NCO config, recv->transmit
-        // spike instrumentation, and TX-drop diagnostics after rhd_reg[22]
-        // (offsets 148..264). This plugin does not surface those fields, so we
-        // stop decoding here -- everything above is byte-exact against the
-        // 264-byte status_response_t (firmware/include/main.h).
+        // LFP/DSP engine config + status (firmware 0e99881+, status >= 160).
+        status.hasLfpStatus = false;
+        status.lfpEnabled = false;
+        status.lfpLaneMask = 0;
+        status.lfpDecimR = 0;
+        status.lfpNumTaps = 0;
+        status.lfpPacketsSent = 0;
+        status.lfpOverrun = false;
+        if (dataLen >= STATUS_RESPONSE_SIZE_LFP) {
+            status.hasLfpStatus = true;
+            status.lfpEnabled  = (*p++) != 0;
+            status.lfpLaneMask = *p++;
+            status.lfpDecimR   = *p++;
+            status.lfpNumTaps  = *p++;
+            status.lfpPacketsSent = unpackU32LE(p); p += 4;
+            status.lfpOverrun  = (*p++) != 0;
+            p += 3;  // reserved
+        }
 
         return true;
     }
@@ -653,9 +671,42 @@ public:
         return true;
     }
     
+    // LFP / DSP engine (firmware 0e99881+). All commands are direct passes
+    // through to the firmware -- the host owns the design (mirrors net.py's
+    // configure_lfp(); see remote/net.py).
+    bool lfpEnable(bool on) {
+        return sendCommand(CMD_LFP_ENABLE, on ? 1 : 0);
+    }
+    bool lfpSetChannels(uint8_t laneMask) {
+        return sendCommand(CMD_LFP_SET_CHANNELS, laneMask);
+    }
+    bool lfpSetParams(uint8_t decimR, uint8_t numTaps) {
+        return sendCommand(CMD_LFP_SET_PARAMS, decimR, numTaps);
+    }
+    bool lfpWriteCoef(bool clearFirst, bool decimatorStage, int32_t coef18) {
+        // Param1 bit1 selects the filter and must be held for every write,
+        // including the pointer clear, or the reset and the writes land in
+        // different filters. Param2 carries the 18-bit signed coefficient.
+        uint32_t p1 = (clearFirst ? 1u : 0u) | (decimatorStage ? 2u : 0u);
+        return sendCommand(CMD_LFP_WRITE_COEF, p1, (uint32_t)(coef18) & 0x3FFFFu);
+    }
+    bool lfpUploadCoefs(bool decimatorStage, const std::vector<int32_t>& coefs) {
+        bool first = true;
+        for (int32_t c : coefs) {
+            if (!lfpWriteCoef(first, decimatorStage, c)) return false;
+            first = false;
+        }
+        return true;
+    }
+
     void setDataCallback(DataCallback callback) {
         std::lock_guard<std::mutex> lock(callbackMutex_);
         dataCallback_ = callback;
+    }
+
+    void setLfpDataCallback(LfpDataCallback callback) {
+        std::lock_guard<std::mutex> lock(callbackMutex_);
+        lfpDataCallback_ = callback;
     }
 
     void setErrorCallback(ErrorCallback callback) {
@@ -1099,9 +1150,9 @@ public:
     // dropped while a slow downstream consumer is busy (the no-loss drain rule
     // from CLAUDE.md / docs/unified-packet-format.md, matching net.py's
     // UnifiedSink._recv_loop). demuxThread_ pops the ring, peeks the common
-    // header's stream_type (word 1, low byte) and routes the broadband stream to
-    // its handler, which tracks the per-packet SEQ (word 4) = the loss check.
-    // The board sends exactly one packet per datagram.
+    // header's stream_type (word 1, low byte) and routes broadband and LFP to
+    // their handlers, each of which tracks that stream's per-packet SEQ (word 4)
+    // = the loss check. The board sends exactly one packet per datagram.
     // ------------------------------------------------------------------------
 
     // Raise the calling thread's scheduling priority so the OS keeps it running
@@ -1161,7 +1212,7 @@ public:
         // socket even when the machine is saturated (e.g. an OpenEphys GUI event
         // storm at ~300% CPU). See raiseThreadPriority(). BOTH the recv and demux
         // threads need this -- if EITHER starves, the recv->demux ring backs up and
-        // we drop (a host-side broadband SEQ gap that net.py never shows).
+        // we drop (a host-side broadband/LFP SEQ gap that net.py never shows).
         raiseThreadPriority();
         udpSocket_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (udpSocket_ == INVALID_SOCKET) {
@@ -1225,7 +1276,7 @@ public:
         }
 
         std::cout << "[IntanInterface] Unified UDP listener bound on port "
-                  << udpPort_ << " (demux by stream_type: broadband-only)"
+                  << udpPort_ << " (demux by stream_type: broadband + LFP on one port)"
                   << std::endl;
 
         // Short timeout so the thread sees running_ == false promptly on stop.
@@ -1395,9 +1446,102 @@ public:
         uint8_t streamType = (uint8_t)(typeVer & 0xFF);
         if (streamType == STREAM_TYPE_BROADBAND) {
             processBroadbandDatagram(data, len);
+        } else if (streamType == STREAM_TYPE_LFP) {
+            processLfpDatagram(data, len);
         }
-        // Non-broadband stream types are silently ignored: this broadband-only
-        // build has no other producer on the unified port.
+        // Other stream types (e.g. WAVELET=3) are silently ignored on this
+        // branch -- they belong to the follow-on consumer.
+    }
+
+    // LFP frame (UNIFIED stream_type = 2). The PL builds the whole wire packet
+    // (common header + decimated samples) and the PS just sends it on UDP 0x6800.
+    // Header layout (docs/unified-packet-format.md, net.py receive_lfp):
+    //   w0 MAGIC=0xCAFEBABE | w1 TYPE_VER (stream_type=2 | version<<8)
+    //   w2/w3 = 64-bit master timestamp (newest input sample of the window)
+    //   w4 = SEQ (PL LFP frame sequence; +1/frame -- the loss check)
+    //   w5 = AUX0 = lane_mask | decim_R<<8 | num_taps<<16 | overrun<<24
+    //   w6 = AUX1 = num_samples (= popcount(lane_mask) * 32)
+    //   w7 = RSVD
+    //   w8.. = popcount(lane_mask)*32 offset-binary 16-bit samples, 2 per word.
+    void processLfpDatagram(const uint8_t* data, size_t len) {
+        static constexpr size_t HDR = COMMON_HEADER_WORDS * 4;  // 32-byte common header
+        if (len < HDR) return;
+
+        uint64_t timestamp = (uint64_t)unpackU32LE(data + 8) |
+                             ((uint64_t)unpackU32LE(data + 12) << 32);   // w2/w3
+        uint32_t seq       = unpackU32LE(data + 16);   // w4 = per-stream SEQ
+        uint32_t aux0      = unpackU32LE(data + 20);   // w5 = AUX0
+        uint32_t numSamples = unpackU32LE(data + 24);  // w6 = AUX1 = num_samples
+
+        uint8_t laneMask = (uint8_t)(aux0 & 0xFF);
+        uint8_t decimR   = (uint8_t)((aux0 >> 8) & 0xFF);
+        uint8_t numTaps  = (uint8_t)((aux0 >> 16) & 0xFF);
+        bool    overrun  = ((aux0 >> 24) & 0x1) != 0;
+
+        // Payload size from the lane mask. Each enabled lane contributes 32
+        // amplifier channels x 1 16-bit sample = 64 bytes per frame. Cross-check
+        // against the AUX1 num_samples field the firmware sends.
+        int popcount = 0;
+        for (int b = 0; b < 8; ++b) popcount += ((laneMask >> b) & 1);
+        size_t expectedSamples = (size_t)popcount * 32;
+        if (numSamples != 0 && numSamples != expectedSamples)
+            return;                                    // mask/cfg drift -- drop
+        size_t expectedBytes   = expectedSamples * sizeof(uint16_t);
+        if (len - HDR < expectedBytes) return;         // truncated / wrong mask
+
+        // Per-stream LFP SEQ continuity = the LFP loss check. A gap means the
+        // board emitted frames we never received. Count + log it (never hide).
+        {
+            std::lock_guard<std::mutex> lock(statsMutex_);
+            if (lfpHaveSeq_) {
+                uint32_t expectedSeq = lfpLastSeq_ + 1;  // wraps at 2^32 naturally
+                uint32_t delta = seq - expectedSeq;      // mod 2^32
+                if (delta == 0) {
+                    // Contiguous (including the 32-bit wrap) -- no loss.
+                } else if (delta < 0x80000000u) {
+                    // FORWARD gap => genuinely dropped LFP frame(s). Count always,
+                    // throttle the log (see the broadband path for why).
+                    lfpSeqGaps_++;
+                    lfpLostFrames_ += delta;
+                    static thread_local std::chrono::steady_clock::time_point lastLfpLoss{};
+                    auto nowTp = std::chrono::steady_clock::now();
+                    if (nowTp - lastLfpLoss > std::chrono::seconds(1)) {
+                        lastLfpLoss = nowTp;
+                        std::cout << "[IntanInterface][LOSS] LFP SEQ gap: expected "
+                                  << expectedSeq << ", got " << seq << " (+" << delta
+                                  << " missing). lfp_seq_gaps=" << lfpSeqGaps_
+                                  << " (throttled)" << std::endl;
+                    }
+                } else {
+                    // BACKWARD jump => stream restart (SEQ resets on START); resync
+                    // silently, not archival loss.
+                }
+            }
+            lfpLastSeq_ = seq;
+            lfpHaveSeq_ = true;
+        }
+
+        // The payload is little-endian uint16, naturally aligned (the common
+        // header is a whole number of 32-bit words). recvfrom hands us a
+        // uint8_t buffer; reinterpret as uint16_t* is safe on our platforms.
+        const uint16_t* samples = reinterpret_cast<const uint16_t*>(data + HDR);
+
+        LfpFrame frame;
+        frame.timestamp     = timestamp;
+        frame.frameSequence = seq;
+        frame.laneMask      = laneMask;
+        frame.decimR        = decimR;
+        frame.numTaps       = numTaps;
+        frame.overrun       = overrun;
+        frame.samples       = samples;
+        frame.sampleCount   = expectedSamples;
+
+        LfpDataCallback cb;
+        {
+            std::lock_guard<std::mutex> lock(callbackMutex_);
+            cb = lfpDataCallback_;
+        }
+        if (cb) cb(frame);
     }
 
     // A datagram is exactly one broadband packet (the board sends one packet
@@ -1796,12 +1940,12 @@ public:
     uint16_t tcpPort_;
     uint16_t udpPort_;
     
-    // Sockets -- ONE UDP socket (unified port).
+    // Sockets -- ONE UDP socket now (unified port; LFP socket removed).
     SOCKET tcpSocket_;
     SOCKET udpSocket_;
 
     // Threading: recvThread_ drains the socket -> ring; demuxThread_ routes by
-    // stream_type to the broadband handler.
+    // stream_type. (Replaces the old per-stream udpThread_/lfpThread_ pair.)
     std::thread recvThread_;
     std::thread demuxThread_;
     std::atomic<bool> running_;
@@ -1860,14 +2004,19 @@ public:
     uint64_t lastPacketCount_;
 
     // Per-stream SEQ loss tracking (the no-loss assertion; header word 4).
-    // Broadband must stay at zero gaps.
+    // Broadband must stay at zero gaps; LFP gaps are logged independently.
     bool     haveSeq_        = false;
     uint32_t lastSeq_        = 0;
     uint64_t seqGaps_        = 0;   // broadband gap events
     uint64_t seqLostPackets_ = 0;   // total broadband packets implied missing
-
+    bool     lfpHaveSeq_     = false;
+    uint32_t lfpLastSeq_     = 0;
+    uint64_t lfpSeqGaps_     = 0;   // LFP gap events
+    uint64_t lfpLostFrames_  = 0;   // total LFP frames implied missing
+    
     // Callbacks
     DataCallback dataCallback_;
+    LfpDataCallback lfpDataCallback_;
     ErrorCallback errorCallback_;
     
     // Auto-detection
@@ -1984,8 +2133,34 @@ bool IntanInterface::readRegister(uint8_t reg, uint16_t& cipo0Value,
     return pImpl_->readRegister(reg, cipo0Value, cipo1Value);
 }
 
+bool IntanInterface::lfpEnable(bool on) {
+    return pImpl_->lfpEnable(on);
+}
+
+bool IntanInterface::lfpSetChannels(uint8_t laneMask) {
+    return pImpl_->lfpSetChannels(laneMask);
+}
+
+bool IntanInterface::lfpSetParams(uint8_t decimR, uint8_t numTaps) {
+    return pImpl_->lfpSetParams(decimR, numTaps);
+}
+
+bool IntanInterface::lfpWriteCoef(bool clearFirst, LfpStage stage, int32_t coef18) {
+    return pImpl_->lfpWriteCoef(clearFirst, stage == LfpStage::Decimator, coef18);
+}
+
+bool IntanInterface::lfpUploadCoefs(LfpStage stage, const std::vector<int32_t>& coefs) {
+    return pImpl_->lfpUploadCoefs(stage == LfpStage::Decimator, coefs);
+}
+
+
+
 void IntanInterface::setDataCallback(DataCallback callback) {
     pImpl_->setDataCallback(callback);
+}
+
+void IntanInterface::setLfpDataCallback(LfpDataCallback callback) {
+    pImpl_->setLfpDataCallback(callback);
 }
 
 void IntanInterface::setErrorCallback(ErrorCallback callback) {
@@ -2140,6 +2315,23 @@ std::string IntanInterface::DeviceStatus::getSummary() const {
             << (int)auxIndex[1] << "/" << (int)auxIndex[2] << "\n";
         oss << "Last inject result: 0x" << std::hex << std::setw(8)
             << std::setfill('0') << auxReadResult << std::dec << "\n";
+    }
+    oss << "--- LFP Engine ---\n";
+    if (!hasLfpStatus) {
+        oss << "(not supported by this firmware -- status < 160 bytes)\n";
+    } else if (!lfpEnabled) {
+        oss << "Disabled  (configure + enable via remote/net.py configure_lfp)\n";
+    } else {
+        int popcount = 0;
+        for (int b = 0; b < 8; ++b) popcount += ((lfpLaneMask >> b) & 1);
+        int outRate = (lfpDecimR > 0) ? (30000 / lfpDecimR) : 0;
+        oss << "ENABLED  mask=0x" << std::hex << (int)lfpLaneMask << std::dec
+            << " (" << popcount << " streams / " << (popcount * 32) << " ch)"
+            << "  decim=" << (int)lfpDecimR
+            << " (" << outRate << " Hz)"
+            << "  taps=" << (int)lfpNumTaps << "\n";
+        oss << "Packets sent: " << lfpPacketsSent
+            << "  Overrun: " << (lfpOverrun ? "YES" : "no") << "\n";
     }
     oss << "===========================";
     return oss.str();
