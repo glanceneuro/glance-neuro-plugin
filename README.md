@@ -1,11 +1,15 @@
-<table><tr>
-<td valign="middle"><img src="Resources/logo.png" height="44" alt="GLANCE logo"></td>
-<td valign="middle">
+<div align="center">
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="Resources/logo-darkmode.png">
+  <img src="Resources/logo.png" alt="GLANCE — Gigabit Low-latency Acquisition for Neuroscience & Closed-loop Experiments" width="680">
+</picture>
 
 # GLANCE — Open Ephys plugin
 
-</td>
-</tr></table>
+by the [Kemere Lab](https://kemerelab.com) at [Rice University](https://neuroengineering.rice.edu)
+
+</div>
 
 An Open Ephys GUI `DataThread` source plugin for the **GLANCE** MicroZed/Zynq-7020 Intan
 acquisition system ([glance-neuro](https://github.com/glanceneuro/glance-neuro)).
