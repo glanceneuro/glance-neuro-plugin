@@ -1,4 +1,11 @@
+<table><tr>
+<td valign="middle"><img src="Resources/logo.png" height="44" alt="GLANCE logo"></td>
+<td valign="middle">
+
 # GLANCE — Open Ephys plugin
+
+</td>
+</tr></table>
 
 An Open Ephys GUI `DataThread` source plugin for the **GLANCE** MicroZed/Zynq-7020 Intan
 acquisition system ([glance-neuro](https://github.com/glanceneuro/glance-neuro)).
