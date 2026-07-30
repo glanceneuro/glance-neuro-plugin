@@ -125,7 +125,9 @@ private:
     // Aux sequencer test tooling (all usable DURING acquisition)
     std::unique_ptr<UtilityButton> statusButton;      // print device status to console
     std::unique_ptr<UtilityButton> fastSettleButton;  // toggle software fast settle
+    std::unique_ptr<UtilityButton> lfpEnableButton;   // toggle LFP/DSP engine + 2nd stream
     bool fastSettleActive;
+    bool lfpActive;
 
     /** Refresh the fast-settle button label/color from node state. The accel
         sweep is now always-on (the board boots into it) so it has no toggle. */
