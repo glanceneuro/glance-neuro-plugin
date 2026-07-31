@@ -37,7 +37,7 @@ using namespace Plugin;
 extern "C" EXPORT void getLibInfo (Plugin::LibraryInfo* info)
 {
     info->apiVersion = PLUGIN_API_VER;
-    info->name = "Intan UDP Interface";
+    info->name = "GLANCE Neuro";
     info->libVersion = "1.0.0";
     info->numPlugins = NUM_PLUGINS;
 }
@@ -48,7 +48,11 @@ extern "C" EXPORT int getPluginInfo (int index, Plugin::PluginInfo* info)
     {
         case 0:
             info->type = Plugin::Type::DATA_THREAD;
-            info->dataThread.name = "Intan UDP Interface Thread";
+            // What the user sees in the processor list and on the block in the
+            // signal chain. Changing it renames the processor, so a signal
+            // chain saved under the old name will not find it -- rebuild those
+            // chains once rather than keeping two names for one thing.
+            info->dataThread.name = "GLANCE Neuro";
             info->dataThread.creator = &createDataThread<IntanSocketNode::IntanSocket>;
             break;
         default:

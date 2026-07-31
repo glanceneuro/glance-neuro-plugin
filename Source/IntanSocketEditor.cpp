@@ -360,12 +360,12 @@ void IntanSocketEditor::buttonClicked(Button* button)
             {
                 // Apply the configuration
                 node->applyDetectionConfig(result);
-                CoreServices::sendStatusMessage("Intan: Auto-detection successful");
+                CoreServices::sendStatusMessage("GLANCE: Auto-detection successful");
                 CoreServices::updateSignalChain(this);
             }
             else
             {
-                CoreServices::sendStatusMessage("Intan: No chips detected");
+                CoreServices::sendStatusMessage("GLANCE: No chips detected");
             }
         }
     }

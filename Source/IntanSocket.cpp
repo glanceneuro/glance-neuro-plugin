@@ -157,7 +157,7 @@ bool IntanSocket::connectDevice(bool printOutput)
             if (printOutput)
             {
                 LOGE("Failed to connect to Intan device at ", device_ip);
-                CoreServices::sendStatusMessage("Intan: Connection failed.");
+                CoreServices::sendStatusMessage("GLANCE: Connection failed.");
             }
             intanInterface.reset();
             return false;
@@ -167,8 +167,8 @@ bool IntanSocket::connectDevice(bool printOutput)
         {
             if (printOutput)
             {
-                LOGE("Intan device not ready");
-                CoreServices::sendStatusMessage("Intan: Device not ready.");
+                LOGE("GLANCE: device not ready");
+                CoreServices::sendStatusMessage("GLANCE: Device not ready.");
             }
             intanInterface.reset();
             return false;
@@ -203,7 +203,7 @@ bool IntanSocket::connectDevice(bool printOutput)
             [this, printOutput](const std::string& error) {
                 if (printOutput)
                 {
-                    LOGE("Intan error: ", error.c_str());
+                    LOGE("GLANCE error: ", error.c_str());
                 }
                 hasError = true;
             }
@@ -233,10 +233,10 @@ bool IntanSocket::connectDevice(bool printOutput)
             // the connection cleanly so the user can retry.
             if (printOutput)
             {
-                LOGE("Intan: status read failed -- board may be still booting. "
+                LOGE("GLANCE: status read failed -- board may be still booting. "
                      "Wait until the ethernet activity LED is steady and try "
                      "CONNECT again.");
-                CoreServices::sendStatusMessage("Intan: not ready, retry CONNECT");
+                CoreServices::sendStatusMessage("GLANCE: not ready, retry CONNECT");
             }
             intanInterface.reset();
             return false;
@@ -247,7 +247,7 @@ bool IntanSocket::connectDevice(bool printOutput)
             if (!intanInterface->setChannelEnable(0x0F))
             {
                 if (printOutput)
-                    LOGE("Intan: setChannelEnable failed during initial seed");
+                    LOGE("GLANCE: setChannelEnable failed during initial seed");
                 intanInterface.reset();
                 return false;
             }
@@ -255,7 +255,7 @@ bool IntanSocket::connectDevice(bool printOutput)
             if (!intanInterface->getStatus(status))
             {
                 if (printOutput)
-                    LOGE("Intan: status re-read failed after channel-enable seed");
+                    LOGE("GLANCE: status re-read failed after channel-enable seed");
                 intanInterface.reset();
                 return false;
             }
@@ -291,7 +291,7 @@ bool IntanSocket::connectDevice(bool printOutput)
             imu_num_channels = IMU_CHANS_PER_PORT *
                                ((imu_port_a ? 1 : 0) + (imu_port_b ? 1 : 0));
             if (printOutput && imu_enabled)
-                LOGC("Intan: BNO055 present on port",
+                LOGC("GLANCE: BNO055 present on port",
                      imu_port_a && imu_port_b ? "s A and B" : (imu_port_a ? " A" : " B"),
                      " -- publishing IMU stream (", imu_num_channels, " channels @ 100 Hz)");
         }
@@ -318,7 +318,7 @@ bool IntanSocket::connectDevice(bool printOutput)
                  " (", num_channels, " channels), debug=",
                  debugMode ? "ON" : "OFF");
             LOGC("Firmware: ", status.getFirmwareVersionString().c_str());
-            CoreServices::sendStatusMessage("Intan: Connected successfully.");
+            CoreServices::sendStatusMessage("GLANCE: Connected successfully.");
         }
 
         getParameter("device_ip")->setEnabled(false);
@@ -341,7 +341,7 @@ bool IntanSocket::connectDevice(bool printOutput)
         if (printOutput)
         {
             LOGE("Exception connecting to Intan: ", e.what());
-            CoreServices::sendStatusMessage("Intan: Connection error.");
+            CoreServices::sendStatusMessage("GLANCE: Connection error.");
         }
         intanInterface.reset();
         return false;
@@ -374,6 +374,10 @@ void IntanSocket::updateSettings(OwnedArray<ContinuousChannel>* continuousChanne
         // base name descriptive of the CONTENT rather than the device.
         "BroadbandStream",
         "Broadband 30 kHz amplifier data",
+        // Stream / channel identifiers stay `intan.*`: they are a metadata
+        // contract that lands in recordings and saved signal chains, not a
+        // display name. The product brand is GLANCE (see OpenEphysLib.cpp);
+        // these name the Intan RHD data they carry.
         "intan.data",
         SAMPLE_RATE,
         generatesTimestamps
@@ -745,11 +749,11 @@ bool IntanSocket::startAcquisition()
         want.portB = imu_port_b;
         if (!intanInterface->setImuStream(want, 0 /* default 100 Hz */, active))
         {
-            LOGE("Intan: could not start the IMU stream (continuing without it)");
+            LOGE("GLANCE: could not start the IMU stream (continuing without it)");
         }
         else if (active.portA != want.portA || active.portB != want.portB)
         {
-            LOGE("Intan: IMU stream started on fewer ports than expected "
+            LOGE("GLANCE: IMU stream started on fewer ports than expected "
                  "(A=", (int)active.portA, " B=", (int)active.portB, ")");
         }
     }
@@ -761,7 +765,7 @@ bool IntanSocket::startAcquisition()
         return false;
     }
     
-    LOGC("Intan acquisition started");
+    LOGC("GLANCE acquisition started");
     startThread();
     
     return true;
@@ -791,7 +795,7 @@ bool IntanSocket::stopAcquisition()
             IntanInterface::ImuStats istats;
             intanInterface->getImuStats(istats);
             if (istats.samples[0] || istats.samples[1])
-                LOGC("Intan IMU: ", (int)istats.samples[0], " samples port A / ",
+                LOGC("GLANCE IMU: ", (int)istats.samples[0], " samples port A / ",
                      (int)istats.samples[1], " port B, SEQ gaps A=",
                      (int)istats.seqGaps[0], " B=", (int)istats.seqGaps[1]);
         }
@@ -801,7 +805,7 @@ bool IntanSocket::stopAcquisition()
     if (imu_buffer_index > 0 && sourceBuffers.size() > imu_buffer_index)
         sourceBuffers[imu_buffer_index]->clear();
 
-    LOGC("Intan acquisition stopped");
+    LOGC("GLANCE acquisition stopped");
     return true;
 }
 
@@ -918,7 +922,7 @@ bool IntanSocket::updateBuffer()
     // dataQueueDrops_ climbs, OpenEphys's own consumer (this DataThread ->
     // sourceBuffer -> processing graph/rendering) can't keep up at ~28k pkts/s.
     // That loss is SILENT -- it happens AFTER the demux SEQ check, so it does NOT
-    // appear as a SEQ gap. Together with the [IntanInterface][DROP] ring log this
+    // appear as a SEQ gap. Together with the [GLANCE][DROP] ring log this
     // pins the stage: ringDrops => demux starved (upstream); dataQueueDrops => OE
     // too slow (here). If BOTH are flat but OE still loses, it's the OE sourceBuffer.
     {
@@ -1271,7 +1275,7 @@ void IntanSocket::setDebugMode(bool enable, uint8_t mask)
         if (!intanInterface || !intanInterface->isReady())
         {
             LOGE("Cannot enable debug mode - device not ready");
-            CoreServices::sendStatusMessage("Intan: Debug mode failed - device not connected");
+            CoreServices::sendStatusMessage("GLANCE: Debug mode failed - device not connected");
             debugMode = false;
             return;
         }
@@ -1280,7 +1284,7 @@ void IntanSocket::setDebugMode(bool enable, uint8_t mask)
         if (!intanInterface->setDebugMode(true))
         {
             LOGE("Failed to send debug mode enable command to hardware");
-            CoreServices::sendStatusMessage("Intan: Failed to enable hardware debug mode");
+            CoreServices::sendStatusMessage("GLANCE: Failed to enable hardware debug mode");
             debugMode = false;
             return;
         }
@@ -1291,7 +1295,7 @@ void IntanSocket::setDebugMode(bool enable, uint8_t mask)
         if (!intanInterface->setChannelEnable(mask))
         {
             LOGE("Failed to set channel enable for debug mode");
-            CoreServices::sendStatusMessage("Intan: Failed to configure channels");
+            CoreServices::sendStatusMessage("GLANCE: Failed to configure channels");
             debugMode = false;
             return;
         }
@@ -1338,8 +1342,8 @@ void IntanSocket::setDebugMode(bool enable, uint8_t mask)
         // Step 7: Update the signal chain to reflect new channel count
         CoreServices::updateSignalChain(sn->getEditor());
         CoreServices::sendStatusMessage(dualPort
-            ? "Intan: Debug mode enabled (dual-port, 268 channels)"
-            : "Intan: Debug mode enabled (single-port, 134 channels)");
+            ? "GLANCE: Debug mode enabled (dual-port, 268 channels)"
+            : "GLANCE: Debug mode enabled (single-port, 134 channels)");
     }
     else
     {
@@ -1394,7 +1398,7 @@ void IntanSocket::setDebugMode(bool enable, uint8_t mask)
         }
         
         LOGC("Debug mode disabled - use RESCAN to detect actual chips");
-        CoreServices::sendStatusMessage("Intan: Debug mode disabled - run RESCAN");
+        CoreServices::sendStatusMessage("GLANCE: Debug mode disabled - run RESCAN");
     }
 }
 // ============================================================================
@@ -1406,7 +1410,7 @@ void IntanSocket::printDeviceStatus()
     if (!intanInterface || !intanInterface->foundInputSource())
     {
         LOGE("Cannot print status - device not connected");
-        CoreServices::sendStatusMessage("Intan: not connected");
+        CoreServices::sendStatusMessage("GLANCE: not connected");
         return;
     }
 
@@ -1414,7 +1418,7 @@ void IntanSocket::printDeviceStatus()
     if (!intanInterface->getStatus(status))
     {
         LOGE("Failed to read device status");
-        CoreServices::sendStatusMessage("Intan: status read failed");
+        CoreServices::sendStatusMessage("GLANCE: status read failed");
         return;
     }
 
@@ -1440,7 +1444,7 @@ void IntanSocket::printDeviceStatus()
          "  sizeErr: ", (int64)rx.sizeErrors);
     LOGC("Rate: ", rx.instantRate, " pkt/s (", rx.dataRateMbps, " Mbps)");
 
-    CoreServices::sendStatusMessage("Intan: status printed to console");
+    CoreServices::sendStatusMessage("GLANCE: status printed to console");
 }
 
 bool IntanSocket::pushFastSettleConfig()
@@ -1470,8 +1474,8 @@ void IntanSocket::setManualFastSettle(bool active)
     {
         LOGC("Fast settle ", active ? "ON" : "OFF",
              " (RHD Reg-0 D5 via the override whole-replacing the fs slot)");
-        CoreServices::sendStatusMessage(active ? "Intan: FAST SETTLE ON"
-                                               : "Intan: fast settle off");
+        CoreServices::sendStatusMessage(active ? "GLANCE: FAST SETTLE ON"
+                                               : "GLANCE: fast settle off");
     }
     else
     {
@@ -1524,7 +1528,7 @@ bool IntanSocket::setAuxSequencerMode(bool enable)
     {
         LOGE("This firmware predates the aux sequencer (86-byte status) - "
              "update BOOT.bin to the aux-seq-v2 build");
-        CoreServices::sendStatusMessage("Intan: firmware lacks aux sequencer");
+        CoreServices::sendStatusMessage("GLANCE: firmware lacks aux sequencer");
         return false;
     }
 
@@ -1579,7 +1583,7 @@ bool IntanSocket::setAuxSequencerMode(bool enable)
     {
         LOGC("Aux accel sweep active - intra-packet de-interleave (10 kHz/axis)");
     }
-    CoreServices::sendStatusMessage("Intan: aux sweep active");
+    CoreServices::sendStatusMessage("GLANCE: aux sweep active");
     return true;
 }
 
@@ -1609,7 +1613,7 @@ bool IntanSocket::setLfpEnabled(bool enable)
         if (!s.hasLfpStatus)
         {
             LOGE("LFP: this firmware does not expose the LFP engine");
-            CoreServices::sendStatusMessage("Intan: firmware lacks LFP engine");
+            CoreServices::sendStatusMessage("GLANCE: firmware lacks LFP engine");
             return false;
         }
     }
@@ -1630,12 +1634,12 @@ bool IntanSocket::setLfpEnabled(bool enable)
         {
             LOGC("LFP enabled - ", lfp_num_channels, " channels @ ",
                  (int)(SAMPLE_RATE / lfp_decim_R), " Hz");
-            CoreServices::sendStatusMessage("Intan: LFP stream ON");
+            CoreServices::sendStatusMessage("GLANCE: LFP stream ON");
         }
         else
         {
             LOGC("LFP disabled");
-            CoreServices::sendStatusMessage("Intan: LFP stream off");
+            CoreServices::sendStatusMessage("GLANCE: LFP stream off");
         }
     }
     return true;

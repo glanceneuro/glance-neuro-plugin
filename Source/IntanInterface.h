@@ -734,12 +734,51 @@ public:
     struct ImuPorts { bool portA = false; bool portB = false; };
 
     /**
+     * @brief PL fabric selectors (firmware `pl_configs` order — append-only).
+     *
+     * The board boots with a BLANK programmable logic and loads one of these
+     * on command, so being connected is not the same as being able to
+     * acquire. `acq_imu_*` variants trade a cable's second CIPO pair for an
+     * I2C bus to the headstage IMU.
+     */
+    enum class FabricConfig : uint32_t {
+        Acquisition  = 0,   // 128-ch LVDS on both cables, no IMU
+        Scan         = 1,   // non-acquisition I2C probe fabric (both ports)
+        AcqImuBoth   = 2,   // 64-ch + IMU on both cables
+        AcqImuPortA  = 3,   // port A 64-ch + IMU, port B 128-ch LVDS
+        AcqImuPortB  = 4    // port A 128-ch LVDS, port B 64-ch + IMU
+    };
+
+    /**
      * @brief Probe both ports for a BNO055 (CMD_DETECT_IMU).
      *
      * Requires a fabric with the AXI IICs (acq_imu_* or scan); returns false
      * on a fabric without them (the firmware refuses rather than hanging).
      */
     bool detectImu(ImuPorts& present);
+
+    /**
+     * @brief Which fabric the PL currently holds. Works in any state (blank,
+     * scan, acquisition) because the firmware answers from its loader record
+     * rather than a PL register.
+     *
+     * @param config −1 when the PL is blank, else a FabricConfig selector
+     * @param isAcq  true when the loaded fabric can actually acquire
+     */
+    bool plStatus(int& config, bool& isAcq);
+
+    /** PCAP-swap the PL to a named fabric. Takes seconds, not milliseconds. */
+    bool setConfig(FabricConfig config);
+
+    /**
+     * @brief Ensure the board can acquire, loading a fabric if it has none.
+     *
+     * Called automatically at connect. Censuses the headstage IMUs on the scan
+     * fabric and loads the acquisition variant matching what is plugged in, so
+     * a headstage with an IMU keeps its I2C and one without keeps all 128
+     * channels. Safe to call when a fabric is already live (returns at once).
+     */
+    bool ensureAcquisitionFabric();
 
     /**
      * @brief Start/stop continuous IMU streaming (CMD_IMU_STREAM).
