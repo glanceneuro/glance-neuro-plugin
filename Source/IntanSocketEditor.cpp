@@ -207,7 +207,7 @@ IntanSocketEditor::IntanSocketEditor(GenericProcessor* parentNode, IntanSocket* 
     rescanButton->setRadius(3.0f);
     rescanButton->setBounds(6, 96, 65, 18);
     rescanButton->addListener(this);
-    rescanButton->setTooltip("Auto-detect connected chips");
+    rescanButton->setTooltip("Detect headstages: pick the matching fabric (IMU or 128-ch), then find chips + phase");
     addAndMakeVisible(rescanButton.get());
     rescanButton->setVisible(false);
 
@@ -352,7 +352,7 @@ void IntanSocketEditor::buttonClicked(Button* button)
     {
         // Run auto-detection
         IntanInterface::AutoDetectionResult result;
-        if (node->runAutoDetection(result, true))
+        if (node->rescanDevice(result))
         {
             updateChipDetection(result);
             

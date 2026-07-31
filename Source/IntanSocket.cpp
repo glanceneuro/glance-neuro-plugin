@@ -281,20 +281,7 @@ bool IntanSocket::connectDevice(bool printOutput)
         // here" answer, not an error. Nothing is started yet: arming a port
         // does a blocking NDOF entry on the board, so it happens in
         // startAcquisition() before the neural stream runs.
-        IntanInterface::ImuPorts present;
-        imu_enabled = imu_port_a = imu_port_b = false;
-        if (intanInterface->detectImu(present))
-        {
-            imu_port_a = present.portA;
-            imu_port_b = present.portB;
-            imu_enabled = imu_port_a || imu_port_b;
-            imu_num_channels = IMU_CHANS_PER_PORT *
-                               ((imu_port_a ? 1 : 0) + (imu_port_b ? 1 : 0));
-            if (printOutput && imu_enabled)
-                LOGC("GLANCE: BNO055 present on port",
-                     imu_port_a && imu_port_b ? "s A and B" : (imu_port_a ? " A" : " B"),
-                     " -- publishing IMU stream (", imu_num_channels, " channels @ 100 Hz)");
-        }
+        refreshImuState();
 
         // Fast-settle / TTL state: prefer the new aux_ctrl readback
         // (firmware 65d5fb5+) which surfaces the actual SW level and TTL
@@ -1174,6 +1161,56 @@ bool IntanSocket::updateBuffer()
     }  // end while: drain the next queued packet (keep the dataQueue empty)
 
     return true;
+}
+
+// Re-read which ports carry a BNO055 and size the IMU stream from it.
+//
+// EVERY path that can change IMU geometry must come through here, for the same
+// reason applyLfpStatus() exists for the LFP band (CLAUDE.md hard rule 1): the
+// stream is published from these fields at updateSettings() time, so a stale
+// value silently yields no IMU channels -- or channels that never fill -- with
+// nothing in the log. Today that is connect and RESCAN; a third caller means
+// calling this, not copying it.
+void IntanSocket::refreshImuState()
+{
+    imu_enabled = imu_port_a = imu_port_b = false;
+    imu_num_channels = 0;
+
+    IntanInterface::ImuPorts present;
+    if (!intanInterface || !intanInterface->detectImu(present))
+    {
+        LOGC("GLANCE: no IMU census available on this fabric -- no IMU stream");
+        return;
+    }
+    imu_port_a = present.portA;
+    imu_port_b = present.portB;
+    imu_enabled = imu_port_a || imu_port_b;
+    imu_num_channels = IMU_CHANS_PER_PORT *
+                       ((imu_port_a ? 1 : 0) + (imu_port_b ? 1 : 0));
+    LOGC("GLANCE: IMU census -- port A ", imu_port_a ? "yes" : "no",
+         ", port B ", imu_port_b ? "yes" : "no",
+         imu_enabled ? " -> publishing IMU stream" : " -> no IMU stream");
+}
+
+// What the RESCAN button means: work out what is plugged in NOW. That is a
+// fabric decision before it is a phase decision -- a headstage with an IMU
+// needs an acq_imu_* fabric, and the phase sweep can only run once the right
+// fabric is live. Chip detection alone (the old behaviour) could never notice
+// an IMU, so the button appeared to ignore them.
+bool IntanSocket::rescanDevice(IntanInterface::AutoDetectionResult& result)
+{
+    if (!intanInterface || !intanInterface->isReady())
+    {
+        LOGE("GLANCE: cannot rescan - device not ready");
+        return false;
+    }
+
+    IntanInterface::ImuPorts present;
+    if (!intanInterface->rescanFabric(present))
+        return false;          // could not load a fabric; nothing else is valid
+
+    refreshImuState();         // geometry for the stream published below
+    return runAutoDetection(result, true);
 }
 
 bool IntanSocket::runAutoDetection(IntanInterface::AutoDetectionResult& result, bool verbose)

@@ -125,6 +125,15 @@ public:
     /** Returns if any errors occurred */
     bool errorFlag();
     
+    /** Re-census the headstage IMUs and size the IMU stream from the result.
+        Every path that can change IMU geometry must call this (see the LFP
+        analogue applyLfpStatus). */
+    void refreshImuState();
+
+    /** Full rescan: pick + load the matching fabric, refresh IMU geometry,
+        then run chip auto-detection. This is what the RESCAN button does. */
+    bool rescanDevice(IntanInterface::AutoDetectionResult& result);
+
     /** Run auto-detection of connected chips */
     bool runAutoDetection(IntanInterface::AutoDetectionResult& result, bool verbose = false);
     

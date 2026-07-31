@@ -781,6 +781,18 @@ public:
     bool ensureAcquisitionFabric();
 
     /**
+     * @brief Full rescan: census the IMUs and load the matching fabric.
+     *
+     * Unlike ensureAcquisitionFabric() this runs whatever is already loaded,
+     * because that is what RESCAN means -- it is the only way a headstage
+     * swapped since connect is noticed. The census runs on the scan fabric,
+     * the only one with I2C on BOTH ports.
+     *
+     * @param present [out] which ports answered with a BNO055
+     */
+    bool rescanFabric(ImuPorts& present);
+
+    /**
      * @brief Start/stop continuous IMU streaming (CMD_IMU_STREAM).
      *
      * The port set is ABSOLUTE (both false = stop everything). Starting a

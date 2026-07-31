@@ -810,30 +810,22 @@ public:
     // the acquisition variant that matches what is actually plugged in, so a
     // headstage with an IMU keeps its I2C and one without keeps all 128
     // channels. Returns false only if no fabric could be brought up.
-    bool ensureAcquisitionFabric() {
-        int config = -1;
-        bool isAcq = false;
-        if (!plStatus(config, isAcq)) {
-            // No PL_STATUS at all: firmware without the deferred-boot loader.
-            // Nothing to arrange -- let the caller proceed as it always did.
-            return true;
-        }
-        if (isAcq)
-            return true;
+    // Census the IMUs and load the acquisition fabric that matches what is
+    // actually plugged in. Always does the full dance, whatever is loaded now --
+    // this is what RESCAN means, and it is the only way a headstage swapped
+    // since connect gets noticed.
+    bool rescanFabric(ImuPorts& present) {
+        present.portA = present.portB = false;
 
-        std::cout << "[GLANCE] board has no acquisition fabric loaded (PL is "
-                  << (config < 0 ? "blank" : "on a scan fabric")
-                  << "); bringing one up..." << std::endl;
-
-        // Census on the scan fabric, which carries both ports' I2C.
-        ImuPorts present;
+        // The census has to happen on the scan fabric: it is the only one with
+        // I2C on BOTH ports, so an acq_imu_port_a fabric could never see a
+        // headstage newly plugged into port B.
         if (setConfig(FabricConfig::Scan) && detectImu(present)) {
             std::cout << "[GLANCE] IMU census: port A "
                       << (present.portA ? "yes" : "no") << ", port B "
                       << (present.portB ? "yes" : "no") << std::endl;
         } else {
-            present.portA = present.portB = false;
-            std::cout << "[GLANCE] IMU census unavailable; assuming none"
+            std::cout << "[GLANCE] IMU census unavailable; assuming no IMUs"
                       << std::endl;
         }
 
@@ -849,6 +841,24 @@ public:
         std::cout << "[GLANCE] loaded fabric " << (int)target
                   << " -- board ready to acquire" << std::endl;
         return true;
+    }
+
+    bool ensureAcquisitionFabric() {
+        int config = -1;
+        bool isAcq = false;
+        if (!plStatus(config, isAcq)) {
+            // No PL_STATUS at all: firmware without the deferred-boot loader.
+            // Nothing to arrange -- let the caller proceed as it always did.
+            return true;
+        }
+        if (isAcq)
+            return true;
+
+        std::cout << "[GLANCE] board has no acquisition fabric loaded (PL is "
+                  << (config < 0 ? "blank" : "on a scan fabric")
+                  << "); bringing one up..." << std::endl;
+        ImuPorts present;
+        return rescanFabric(present);
     }
 
     // IMU control. detectImu is a one-shot probe (refused by the firmware on a
@@ -2447,6 +2457,10 @@ bool IntanInterface::setConfig(FabricConfig config) {
 
 bool IntanInterface::ensureAcquisitionFabric() {
     return pImpl_->ensureAcquisitionFabric();
+}
+
+bool IntanInterface::rescanFabric(ImuPorts& present) {
+    return pImpl_->rescanFabric(present);
 }
 
 bool IntanInterface::setImuStream(const ImuPorts& ports, uint32_t periodMs,
