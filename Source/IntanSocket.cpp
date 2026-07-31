@@ -736,8 +736,10 @@ bool IntanSocket::startAcquisition()
     // data anyway (the IMU channels stay at their last values).
     if (imu_enabled)
     {
-        imuSampleCounter = 0;
-        imuConvBuf.assign((size_t)imu_num_channels, 0.0f);
+        // imuConvBuf is deliberately NOT touched here -- the demux thread owns
+        // it (see the header). Samples may already be in flight because the
+        // board's IMU stream outlives a neural stop.
+        imuSampleCounter.store(0, std::memory_order_relaxed);
         IntanInterface::ImuPorts want, active;
         want.portA = imu_port_a;
         want.portB = imu_port_b;
@@ -895,7 +897,7 @@ void IntanSocket::processImuSample(const IntanInterface::ImuSample& sample)
     // Sample numbers must be monotonic across the stream; the per-port SEQ is
     // not (two ports interleave), so count pushes locally. The board's PL
     // timestamp still rides along, which is what aligns IMU with neural data.
-    int64 imuSampleNumber = imuSampleCounter++;
+    int64 imuSampleNumber = imuSampleCounter.fetch_add(1, std::memory_order_relaxed);
     double imuTimestamp = (double)sample.timestamp;
 
     sourceBuffers[imu_buffer_index]->addToBuffer(imuConvBuf.data(),

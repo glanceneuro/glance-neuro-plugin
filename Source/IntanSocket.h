@@ -8,6 +8,7 @@
 #include "IntanInterface.h"
 #include <memory>
 #include <mutex>
+#include <atomic>
 #include <condition_variable>
 #include <queue>
 
@@ -74,8 +75,13 @@ public:
     static constexpr float IMU_SAMPLE_RATE = 100.0f;   // BNO055 NDOF fusion rate
     // Latest sample per port, held so a partial update (one port's packet)
     // still pushes a full-width frame instead of zeroing the other port.
+    // Owned by the demux thread alone (processImuSample), exactly like
+    // lfpConvBuf. The GUI thread must not touch it: the board's IMU stream has
+    // an independent lifecycle, so samples can already be arriving when
+    // startAcquisition runs, and resizing a vector under a concurrent writer
+    // is a crash rather than a glitch.
     std::vector<float> imuConvBuf;
-    int64 imuSampleCounter = 0;
+    std::atomic<int64> imuSampleCounter { 0 };
     // Which sourceBuffers slot the IMU stream owns. sourceBuffers is indexed
     // in DataStream publication order, and the LFP stream may or may not be
     // published, so this cannot be a constant. -1 = no IMU stream published.
