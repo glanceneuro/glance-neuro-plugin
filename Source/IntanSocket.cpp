@@ -603,6 +603,33 @@ void IntanSocket::updateSettings(OwnedArray<ContinuousChannel>* continuousChanne
         static const char* kAxisUnits[IMU_CHANS_PER_PORT] = {
             "", "", "", "", "m/s^2", "m/s^2", "m/s^2", "deg/s", "deg/s", "deg/s"
         };
+        // bitVolts is NOT cosmetic here: the record engine stores
+        // int16 = sample / bitVolts (BinaryRecording.cpp scales by
+        // 1/(0x7fff*bitVolts) then re-multiplies by 0x7fff), so the effective
+        // full scale is 32767 x bitVolts. Publishing engineering units with
+        // bitVolts = 1.0 quantised every channel to whole units -- which
+        // ANNIHILATES a quaternion (|q| <= 1 -> 0 or +-1), left accel in 1 m/s^2
+        // steps, and let only gyro survive because its numbers happen to be
+        // large. Setting bitVolts to the BNO055's native LSB makes the stored
+        // int16 exactly the raw sensor count: lossless, and the full int16 range
+        // is used.
+        //
+        // inputRange is what the LFP viewer's per-AUX auto-scale reads
+        // (LfpDisplay::updateRange -> channelMetadata inputRangeMin/Max), so
+        // each quantity gets a sensible display range instead of sharing the
+        // ±5000 default that made a ±1 quaternion invisible.
+        static const float kAxisBitVolts[IMU_CHANS_PER_PORT] = {
+            1.0f / 16384.0f, 1.0f / 16384.0f, 1.0f / 16384.0f, 1.0f / 16384.0f, // quat: 1 = 2^14
+            0.01f, 0.01f, 0.01f,                                                // accel: 1 LSB = 0.01 m/s^2
+            1.0f / 16.0f, 1.0f / 16.0f, 1.0f / 16.0f                            // gyro: 1 LSB = 1/16 deg/s
+        };
+        // Full scale of the sensor as NDOF configures it: quaternion is a unit
+        // quaternion, accel is +-4 g, gyro is +-2000 deg/s.
+        static const float kAxisRange[IMU_CHANS_PER_PORT] = {
+            1.0f, 1.0f, 1.0f, 1.0f,
+            39.24f, 39.24f, 39.24f,
+            2000.0f, 2000.0f, 2000.0f
+        };
         for (int p = 0; p < 2; ++p)
         {
             if (p == 0 && !imu_port_a) continue;
@@ -615,11 +642,13 @@ void IntanSocket::updateSettings(OwnedArray<ContinuousChannel>* continuousChanne
                     portPrefix + kAxisNames[k],
                     "Headstage IMU (BNO055 NDOF fusion)",
                     "intan.continuous.imu",
-                    1.0f,               // samples already arrive in engineering units
+                    kAxisBitVolts[k],   // -> stored int16 is the raw BNO055 count
                     imuStream
                 };
                 continuousChannels->add(new ContinuousChannel(is));
                 continuousChannels->getLast()->setUnits(kAxisUnits[k]);
+                continuousChannels->getLast()->inputRange.min = -kAxisRange[k];
+                continuousChannels->getLast()->inputRange.max = +kAxisRange[k];
             }
         }
 
