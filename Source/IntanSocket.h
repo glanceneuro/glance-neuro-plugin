@@ -239,7 +239,7 @@ private:
         across `popcount(lane_mask) * 32` LFP channels. */
     void processLfpFrame(const IntanInterface::LfpFrame& frame);
 
-    /** Push one IMU sample into the third DataStream (stream_type = 4). */
+    /** Push one IMU sample into the third DataStream (stream_type = 3). */
     void processImuSample(const IntanInterface::ImuSample& sample);
 
     /** Number of enabled 16-bit data streams in the 8-bit mask.

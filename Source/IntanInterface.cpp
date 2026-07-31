@@ -77,7 +77,7 @@ namespace {
     constexpr size_t   COMMON_HEADER_WORDS    = 8;   // the 8 shared header words
     constexpr uint8_t  STREAM_TYPE_BROADBAND  = 1;
     constexpr uint8_t  STREAM_TYPE_LFP        = 2;
-    constexpr uint8_t  STREAM_TYPE_IMU        = 4;   // BNO055 side channel (type 3 reserved)
+    constexpr uint8_t  STREAM_TYPE_IMU        = 3;   // BNO055 side channel
     // A fabric swap reads a ~4 MB bitstream off the SD card and programs the
     // PL through PCAP. net.py allows 15 s for the same command.
     constexpr uint32_t kFabricLoadTimeoutMs   = 20000;
@@ -1649,10 +1649,10 @@ public:
         // branch -- they belong to the follow-on consumer.
     }
 
-    // IMU sample (UNIFIED stream_type = 4). Unlike broadband/LFP this stream is
+    // IMU sample (UNIFIED stream_type = 3). Unlike broadband/LFP this stream is
     // built by the PS (its source is I2C, not a PL BRAM), one datagram per fused
     // sample per port at 100 Hz. Layout (docs/unified-packet-format.md):
-    //   w0 MAGIC | w1 TYPE_VER (stream_type=4 | version<<8 | port<<16)
+    //   w0 MAGIC | w1 TYPE_VER (stream_type=3 | version<<8 | port<<16)
     //   w2/w3 = 64-bit PL master timestamp (same clock as the neural data)
     //   w4 = SEQ (PER PORT -- each port is its own stream)
     //   w5 = AUX0 = period_ms | iic_errors<<16 | send_drops<<24

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Rice University
 //
-// Contract test for the plugin's IMU (stream_type = 4) decoder.
+// Contract test for the plugin's IMU (stream_type = 3) decoder.
 //
 // The plugin is the THIRD consumer of the packet contract, after the firmware
 // and remote/net.py in glance-neuro, and nothing enforces its side
@@ -27,7 +27,7 @@ namespace {
 // --- mirrored verbatim from Source/IntanInterface.cpp -----------------------
 constexpr uint32_t UNIFIED_MAGIC       = 0xCAFEBABE;
 constexpr size_t   COMMON_HEADER_WORDS = 8;
-constexpr uint8_t  STREAM_TYPE_IMU     = 4;
+constexpr uint8_t  STREAM_TYPE_IMU     = 3;
 constexpr size_t   IMU_PACKET_BYTES    = 52;
 constexpr float    BNO055_QUAT_SCALE   = 1.0f / 16384.0f;
 constexpr float    BNO055_ACCEL_SCALE  = 1.0f / 100.0f;

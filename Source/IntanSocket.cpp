@@ -567,7 +567,7 @@ void IntanSocket::updateSettings(OwnedArray<ContinuousChannel>* continuousChanne
     }
 
     // ------------------------------------------------------------------
-    // THIRD stream: IMU (stream_type = 4), published only when a BNO055
+    // THIRD stream: IMU (stream_type = 3), published only when a BNO055
     // actually answered at connect time. 10 channels per streaming port --
     // quaternion w/x/y/z (unitless), accel x/y/z (m/s^2), gyro x/y/z (deg/s)
     // -- at the BNO055's 100 Hz fusion rate. This is a low-rate side channel;

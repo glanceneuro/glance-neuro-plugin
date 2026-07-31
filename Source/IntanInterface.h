@@ -282,7 +282,7 @@ public:
     using LfpDataCallback = std::function<void(const LfpFrame&)>;
 
     /**
-     * @brief One BNO055 fused sample (UNIFIED UDP port, stream_type = 4;
+     * @brief One BNO055 fused sample (UNIFIED UDP port, stream_type = 3;
      * see docs/unified-packet-format.md in glance-neuro).
      *
      * A low-rate side channel (default 100 Hz per port), NOT part of the
@@ -308,7 +308,7 @@ public:
 
     /**
      * @brief Callback type for receiving an IMU sample (UNIFIED UDP port,
-     * stream_type = 4). Invoked from the demux thread.
+     * stream_type = 3). Invoked from the demux thread.
      */
     using ImuDataCallback = std::function<void(const ImuSample&)>;
 
@@ -719,7 +719,7 @@ public:
     void setLfpDataCallback(LfpDataCallback callback);
 
     /**
-     * @brief Register callback for IMU samples (UNIFIED port, stream_type = 4).
+     * @brief Register callback for IMU samples (UNIFIED port, stream_type = 3).
      *
      * Invoked from the demux thread once per fused sample per streaming port.
      * The ImuSample is fully by-value, so it may be copied freely.
