@@ -82,6 +82,20 @@ public:
     // is a crash rather than a glitch.
     std::vector<float> imuConvBuf;
     std::atomic<int64> imuSampleCounter { 0 };
+    // Serialises the IMU stream's geometry against its consumer.
+    //
+    // processImuSample() runs on the DEMUX thread and can fire at ANY time
+    // after connect, because the board's IMU stream has a lifecycle of its own
+    // -- it survives a neural stop, an Open Ephys crash, and a disconnect. The
+    // GUI thread meanwhile rebuilds that geometry in updateSettings() and
+    // refreshImuState(). Without this lock, updateSettings() frees and
+    // reallocates (DataBuffer::resize) the very buffer the demux thread is
+    // memcpy-ing into, and a torn read of the port flags vs the channel count
+    // walks imuConvBuf off its end. A lock is affordable here precisely because
+    // this is the 100 Hz path, not the 30 kHz one -- do NOT copy this pattern
+    // to the broadband path.
+    std::mutex imuMutex;
+
     // Which sourceBuffers slot the IMU stream owns. sourceBuffers is indexed
     // in DataStream publication order, and the LFP stream may or may not be
     // published, so this cannot be a constant. -1 = no IMU stream published.
@@ -125,6 +139,10 @@ public:
     /** Returns if any errors occurred */
     bool errorFlag();
     
+    /** Stop the board's IMU stream, logging (not throwing) on failure. The
+        board's IMU stream outlives the plugin's session unless stopped. */
+    void stopImuStreamQuietly();
+
     /** Re-census the headstage IMUs and size the IMU stream from the result.
         Every path that can change IMU geometry must call this (see the LFP
         analogue applyLfpStatus). */

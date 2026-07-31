@@ -132,6 +132,7 @@ void IntanSocket::disconnectDevice()
     if (intanInterface)
     {
         intanInterface->stopAcquisition();
+        stopImuStreamQuietly();
         intanInterface.reset();
     }
     
@@ -585,14 +586,23 @@ void IntanSocket::updateSettings(OwnedArray<ContinuousChannel>* continuousChanne
         DataStream* imuStream = new DataStream(imuSettings);
         sourceStreams->add(imuStream);
 
-        // The IMU buffer's slot depends on whether the LFP stream was
-        // published above -- sourceBuffers is indexed in publication order.
-        imu_buffer_index = sourceStreams->size() - 1;
-        int imuBufferSamples = (int)(IMU_SAMPLE_RATE * bufferSizeInSeconds);
-        if (imuBufferSamples < 1000) imuBufferSamples = 1000;  // 100 Hz: keep depth generous
-        while (sourceBuffers.size() <= imu_buffer_index)
-            sourceBuffers.add(new DataBuffer(imu_num_channels, imuBufferSamples));
-        sourceBuffers[imu_buffer_index]->resize(imu_num_channels, imuBufferSamples);
+        // Build the buffer BEFORE publishing the index that names it, and do
+        // the whole thing under imuMutex. Publishing first let the demux thread
+        // enter addToBuffer() on a slot that DataBuffer::resize() was about to
+        // free and reallocate -- a segfault inside memcpy, reachable whenever
+        // the board's IMU stream is live while Open Ephys is stopped.
+        {
+            std::lock_guard<std::mutex> lock(imuMutex);
+            imu_buffer_index = -1;          // demux thread stands down first
+            int idx = sourceStreams->size() - 1;
+            int imuBufferSamples = (int)(IMU_SAMPLE_RATE * bufferSizeInSeconds);
+            if (imuBufferSamples < 1000) imuBufferSamples = 1000;  // 100 Hz: keep depth generous
+            while (sourceBuffers.size() <= idx)
+                sourceBuffers.add(new DataBuffer(imu_num_channels, imuBufferSamples));
+            sourceBuffers[idx]->resize(imu_num_channels, imuBufferSamples);
+            imuConvBuf.assign((size_t)imu_num_channels, 0.0f);
+            imu_buffer_index = idx;         // ... and only now may it resume
+        }
 
         // Channel names carry the physical quantity and unit, so the value is
         // readable in the GUI without consulting this source.
@@ -778,6 +788,10 @@ bool IntanSocket::startAcquisition()
     if (!intanInterface->startAcquisition())
     {
         LOGE("Failed to start acquisition on device");
+        // The IMU was armed a few lines up. Unwind it, or it streams into a
+        // session that never started -- and the board keeps sending after the
+        // user has been told acquisition failed.
+        if (imu_enabled) stopImuStreamQuietly();
         return false;
     }
     
@@ -805,8 +819,7 @@ bool IntanSocket::stopAcquisition()
         // Stopping never blocks, so it is safe here.
         if (imu_enabled)
         {
-            IntanInterface::ImuPorts none, active;
-            intanInterface->setImuStream(none, 0, active);
+            stopImuStreamQuietly();
 
             IntanInterface::ImuStats istats;
             intanInterface->getImuStats(istats);
@@ -896,6 +909,10 @@ void IntanSocket::processImuSample(const IntanInterface::ImuSample& sample)
     // Called from IntanInterface's demux thread. No stream published (no IMU
     // at connect time, or the board started streaming a port we didn't
     // publish) -> nothing to push into.
+    // Everything below reads geometry the GUI thread can rewrite (updateSettings,
+    // refreshImuState), so it is all inside one lock. 100 Hz -- affordable.
+    std::lock_guard<std::mutex> lock(imuMutex);
+
     if (imu_buffer_index < 0 || imu_num_channels <= 0) return;
     if (sourceBuffers.size() <= imu_buffer_index) return;
     if (sample.port == 0 && !imu_port_a) return;
@@ -910,6 +927,8 @@ void IntanSocket::processImuSample(const IntanInterface::ImuSample& sample)
     // forward -- a sample-and-hold, which is the honest representation of two
     // asynchronous sensors on one DataStream.
     int base = (sample.port == 1 && imu_port_a) ? IMU_CHANS_PER_PORT : 0;
+    if (base + IMU_CHANS_PER_PORT > (int)imuConvBuf.size())
+        return;                    // geometry says this port has no block here
     for (int i = 0; i < 4; ++i) imuConvBuf[base + i]     = sample.quat[i];
     for (int i = 0; i < 3; ++i) imuConvBuf[base + 4 + i] = sample.accel[i];
     for (int i = 0; i < 3; ++i) imuConvBuf[base + 7 + i] = sample.gyro[i];
@@ -1200,25 +1219,60 @@ bool IntanSocket::updateBuffer()
 // value silently yields no IMU channels -- or channels that never fill -- with
 // nothing in the log. Today that is connect and RESCAN; a third caller means
 // calling this, not copying it.
+// Stop the board's IMU stream, tolerating failure. Called from the paths that
+// tear a session down, because the board's IMU stream does NOT stop by itself:
+// it survives a neural stop, a disconnect, and an Open Ephys crash. Leaving it
+// running is not cosmetic -- the firmware refuses DETECT_IMU while a port is
+// streaming, so the NEXT connect censuses nothing and publishes no IMU stream
+// even though the IMU is sitting there transmitting.
+void IntanSocket::stopImuStreamQuietly()
+{
+    if (!intanInterface) return;
+    IntanInterface::ImuPorts none, active;
+    if (!intanInterface->setImuStream(none, 0, active))
+    {
+        LOGE("GLANCE: could not stop the board's IMU stream -- it will keep "
+             "sending; a RESCAN or reconnect will clear it");
+    }
+    else if (active.portA || active.portB)
+    {
+        LOGE("GLANCE: board still reports IMU ports streaming after stop");
+    }
+}
+
 void IntanSocket::refreshImuState()
 {
-    imu_enabled = imu_port_a = imu_port_b = false;
-    imu_num_channels = 0;
-
+    // The census is a blocking TCP round trip, so it happens OUTSIDE the lock.
+    // Holding imuMutex across it would park the demux thread for the command
+    // timeout, and the recv->demux ring would back up behind it -- trading an
+    // IMU race for broadband loss, which is a strictly worse bargain.
     IntanInterface::ImuPorts present;
-    if (!intanInterface || !intanInterface->detectImu(present))
+    bool censused = intanInterface && intanInterface->detectImu(present);
+
+    // Publish the new geometry as ONE atomic step. The demux thread reads these
+    // four fields together; a torn view (new channel count, stale port flag)
+    // indexes imuConvBuf past its end -- a 40-byte heap overflow on exactly the
+    // A+B -> A-only rescan this function exists to handle.
+    {
+        std::lock_guard<std::mutex> lock(imuMutex);
+        imu_port_a = censused && present.portA;
+        imu_port_b = censused && present.portB;
+        imu_enabled = imu_port_a || imu_port_b;
+        imu_num_channels = IMU_CHANS_PER_PORT *
+                           ((imu_port_a ? 1 : 0) + (imu_port_b ? 1 : 0));
+        imuConvBuf.clear();        // re-sized to the new geometry on next sample
+    }
+
+    if (!censused)
     {
         LOGC("GLANCE: no IMU census available on this fabric -- no IMU stream");
-        return;
     }
-    imu_port_a = present.portA;
-    imu_port_b = present.portB;
-    imu_enabled = imu_port_a || imu_port_b;
-    imu_num_channels = IMU_CHANS_PER_PORT *
-                       ((imu_port_a ? 1 : 0) + (imu_port_b ? 1 : 0));
-    LOGC("GLANCE: IMU census -- port A ", imu_port_a ? "yes" : "no",
-         ", port B ", imu_port_b ? "yes" : "no",
-         imu_enabled ? " -> publishing IMU stream" : " -> no IMU stream");
+    else
+    {
+        LOGC("GLANCE: IMU census -- port A ", imu_port_a ? "yes" : "no",
+             ", port B ", imu_port_b ? "yes" : "no",
+             imu_enabled ? " -> publishing IMU stream" : " -> no IMU stream");
+    }
 }
 
 // What the RESCAN button means: work out what is plugged in NOW. That is a
@@ -1237,6 +1291,27 @@ bool IntanSocket::rescanDevice(IntanInterface::AutoDetectionResult& result)
     IntanInterface::ImuPorts present;
     if (!intanInterface->rescanFabric(present))
         return false;          // could not load a fabric; nothing else is valid
+
+    // A fabric swap resets PL state, so EVERY geometry the plugin caches is now
+    // stale -- not just the IMU's. Hard rule 1 applies here as much as anywhere:
+    // pl_config_apply() calls pl_lfp_set_config(enable = 0), so the swap turns
+    // the LFP engine OFF, and the PCAP reprogram resets the channel-enable
+    // register. Re-read the device instead of trusting what we held before.
+    // Without this, a RESCAN that finds no chips leaves the plugin believing
+    // LFP is on and publishing a stream that records pure zeros, silently --
+    // which is the exact failure that rule exists to prevent.
+    IntanInterface::DeviceStatus status;
+    if (intanInterface->getStatus(status))
+    {
+        channel_enable_mask = status.channelEnable;
+        num_channels = calculateNumChannels(channel_enable_mask);
+        applyLfpStatus(status);
+    }
+    else
+    {
+        LOGE("GLANCE: could not re-read status after the fabric swap -- "
+             "LFP/channel geometry may be stale; reconnect before recording");
+    }
 
     refreshImuState();         // geometry for the stream published below
     return runAutoDetection(result, true);
