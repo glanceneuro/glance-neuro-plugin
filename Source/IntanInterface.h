@@ -736,10 +736,11 @@ public:
     /**
      * @brief PL fabric selectors (firmware `pl_configs` order — append-only).
      *
-     * The board boots with a BLANK programmable logic and loads one of these
-     * on command, so being connected is not the same as being able to
-     * acquire. `acq_imu_*` variants trade a cable's second CIPO pair for an
-     * I2C bus to the headstage IMU.
+     * The board boots with the default Acquisition fabric already configured by
+     * the FSBL, and swaps to one of the others on command. So a connected board
+     * can always acquire -- but which fabric is live is a runtime property, and
+     * the plugin has to ask rather than assume. `acq_imu_*` variants trade a
+     * cable's second CIPO pair for an I2C bus to the headstage IMU.
      */
     enum class FabricConfig : uint32_t {
         Acquisition  = 0,   // 128-ch LVDS on both cables, no IMU
@@ -785,8 +786,8 @@ public:
      *
      * Unlike ensureAcquisitionFabric() this runs whatever is already loaded,
      * because that is what RESCAN means -- it is the only way a headstage
-     * swapped since connect is noticed. The census runs on the scan fabric,
-     * the only one with I2C on BOTH ports.
+     * swapped since connect is noticed. The census runs on acq_imu_both, the
+     * only fabric with I2C on BOTH ports.
      *
      * @param present [out] which ports answered with a BNO055
      */

@@ -1314,7 +1314,31 @@ bool IntanSocket::rescanDevice(IntanInterface::AutoDetectionResult& result)
     }
 
     refreshImuState();         // geometry for the stream published below
-    return runAutoDetection(result, true);
+    if (!runAutoDetection(result, true))
+        return false;
+
+    // Seating check. An IMU answering on a cable's I2C bus proves the headstage
+    // is plugged in and powered, so if that same cable's CIPO0 scores no chip,
+    // the likely cause is a partly-seated connector rather than an empty port --
+    // the two lanes come through the same Omnetics shell. Worth saying out loud:
+    // the recording would otherwise start with that port silently contributing
+    // nothing, and the operator finds out afterwards.
+    //
+    // net.py deliberately does not special-case this (it already prints the
+    // census and the per-lane scores for a human to read); the notification
+    // belongs here, where someone is actually looking while setting up.
+    const bool aFault = present.portA && !result.cipo0Detected;
+    const bool bFault = present.portB && !result.portBCipo0Detected;
+    if (aFault || bFault)
+    {
+        const char* which = aFault && bFault ? "A and B" : (aFault ? "A" : "B");
+        LOGE("GLANCE: port ", which, " has an IMU but no chip on CIPO0 -- "
+             "check the headstage is fully seated");
+        CoreServices::sendStatusMessage(
+            juce::String("GLANCE: port ") + which +
+            " IMU found but no chip - check headstage seating");
+    }
+    return true;
 }
 
 bool IntanSocket::runAutoDetection(IntanInterface::AutoDetectionResult& result, bool verbose)

@@ -310,10 +310,11 @@ public:
         }
         
         // Auto-configure UDP destination
-        // Bring up an acquisition fabric FIRST. The board boots blank, and a
-        // blank PL refuses every command that touches acquisition registers --
-        // which used to make a fresh reboot look like a dead board: the UDP
-        // destination was NACKed and the initial getStatus failed.
+        // Make sure an acquisition fabric is live FIRST. The board normally
+        // boots with one already configured by the FSBL, but a PL that is blank
+        // (bitstream omitted from BOOT.bin, or a failed swap) refuses every
+        // command touching acquisition registers -- which reads as a dead board:
+        // the UDP destination is NACKed and the initial getStatus fails.
         ensureAcquisitionFabric();
 
         autoConfigureUdp();
@@ -778,10 +779,11 @@ public:
     }
 
     // --- PL fabric (deferred boot) ------------------------------------------
-    // The board boots with a BLANK programmable logic and loads a fabric on
-    // command, so "connected" and "able to acquire" are different states. Any
-    // command that touches acquisition registers is refused until a fabric is
-    // live, which is why a fresh reboot used to fail at getStatus.
+    // The board boots with the default acquisition fabric configured by the
+    // FSBL and swaps to others on command, so which fabric is live is a runtime
+    // property to ask about, not assume. If the PL is blank -- bitstream omitted
+    // or a swap failed -- every command touching acquisition registers is
+    // refused, so "connected" and "able to acquire" can still differ.
     bool plStatus(int& config, bool& isAcq) {
         uint8_t data[8];
         size_t dataLen = sizeof(data);
@@ -805,11 +807,6 @@ public:
         return (int32_t)unpackU32LE(data) == 0;      // rc == 0
     }
 
-    // Make the board ready to acquire, loading a fabric if it has none.
-    // Mirrors net.py's `rescan`: census the IMUs on the scan fabric, then pick
-    // the acquisition variant that matches what is actually plugged in, so a
-    // headstage with an IMU keeps its I2C and one without keeps all 128
-    // channels. Returns false only if no fabric could be brought up.
     // Census the IMUs and load the acquisition fabric that matches what is
     // actually plugged in. Always does the full dance, whatever is loaded now --
     // this is what RESCAN means, and it is the only way a headstage swapped
@@ -858,7 +855,7 @@ public:
             return true;
 
         std::cout << "[GLANCE] board has no acquisition fabric loaded (PL is "
-                  << (config < 0 ? "blank" : "on a scan fabric")
+                  << (config < 0 ? "blank" : "on a non-acquisition fabric")
                   << "); bringing one up..." << std::endl;
         ImuPorts present;
         return rescanFabric(present);

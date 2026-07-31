@@ -11,7 +11,7 @@ board. It publishes up to three streams: **broadband** at 30 kHz, a decimated **
 band at 3 kHz, and a headstage **IMU** side channel at 100 Hz — all arriving on one UDP
 port and demultiplexed by `stream_type` in the common header.
 
-The IMU stream (`stream_type = 4`, BNO055 fusion) is published only when a BNO055
+The IMU stream (`stream_type = 3`, BNO055 fusion) is published only when a BNO055
 answers at connect time, which needs the board on an `acq_imu_*` fabric. It carries 10
 channels per port (quaternion w/x/y/z, accel x/y/z in m/s², gyro x/y/z in °/s), already
 scaled to engineering units, stamped with the **PL master timestamp** so IMU samples
@@ -71,8 +71,8 @@ strips the header — re-add it.
 ## Gotchas
 
 - **Open Ephys appends its own `-A`/`-B` suffix** per stream. The base names here are
-  `BroadbandStream` and `LFPStream`, so `BroadbandStream-A` is correct and expected.
-  Useful as a build check: `IntanStream-A` means an old build is loaded.
+  `BroadbandStream`, `LFPStream` and `IMUStream`, so `BroadbandStream-A` is correct and
+  expected. Useful as a build check: `IntanStream-A` means an old build is loaded.
 - Stream **channel order follows the mask's bit order** (low→high, port A then B), the
   same packing the firmware uses. LFP channels mirror the broadband layout with an `LFP_`
   prefix.
