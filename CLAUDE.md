@@ -7,9 +7,17 @@ that is easy to get wrong.
 ## What this is
 
 An Open Ephys `DataThread` source plugin for the GLANCE MicroZed/Zynq-7020 acquisition
-board. It publishes two streams: **broadband** at 30 kHz and a decimated **LFP** band at
-3 kHz, both arriving on one UDP port and demultiplexed by `stream_type` in the common
-header.
+board. It publishes up to three streams: **broadband** at 30 kHz, a decimated **LFP**
+band at 3 kHz, and a headstage **IMU** side channel at 100 Hz — all arriving on one UDP
+port and demultiplexed by `stream_type` in the common header.
+
+The IMU stream (`stream_type = 4`, BNO055 fusion) is published only when a BNO055
+answers at connect time, which needs the board on an `acq_imu_*` fabric. It carries 10
+channels per port (quaternion w/x/y/z, accel x/y/z in m/s², gyro x/y/z in °/s), already
+scaled to engineering units, stamped with the **PL master timestamp** so IMU samples
+align with neural samples without host-side clock matching. Arming a port does a
+blocking NDOF entry on the board, so `startAcquisition()` starts the IMU **before** the
+neural stream — that ordering is required, not incidental.
 
 `IntanInterface.{h,cpp}` is a standalone C++ client for the board protocol with no JUCE
 dependency. It is the **third consumer of the register/packet contract**, after the
@@ -78,7 +86,8 @@ strips the header — re-add it.
 ## Testing
 
 ```bash
-bash test/run_test.sh        # no JUCE, no Open Ephys, no board needed
+bash test/run_test.sh                              # no JUCE, no Open Ephys, no board
+bash test/run_imu_decode_test.sh [../glance-neuro] # IMU cross-repo contract test
 ```
 
 `test/` holds a **differential** test of the one thing worth guarding here: it builds
@@ -88,6 +97,14 @@ logic (`unified_parse_test.cpp`) and with a `net.py`-style reference decoder
 per-stream SEQ-gap detection fails the run. It guards the wire-format contract rather
 than an implementation, which is why it earns its keep — keep it in step when the decode
 changes.
+
+`test/run_imu_decode_test.sh` guards the same contract for the IMU stream, but from the
+other direction and across repos: it runs the **firmware's own** host test in
+glance-neuro (`firmware/test-host`, a simulated AXI IIC + BNO055) to emit real
+datagrams, then decodes those bytes with the plugin's field offsets and BNO055 scale
+factors. Because the producer is the firmware itself, a wire-format change in the board
+repo fails here rather than silently reaching Open Ephys as wrong physical units. It
+skips cleanly (exit 2) if glance-neuro isn't checked out alongside.
 
 There is deliberately nothing beyond that. The rest of this plugin is I/O against a live
 board or the GUI, and a mock would assert only that the mock matches itself.

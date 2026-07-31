@@ -282,6 +282,37 @@ public:
     using LfpDataCallback = std::function<void(const LfpFrame&)>;
 
     /**
+     * @brief One BNO055 fused sample (UNIFIED UDP port, stream_type = 4;
+     * see docs/unified-packet-format.md in glance-neuro).
+     *
+     * A low-rate side channel (default 100 Hz per port), NOT part of the
+     * 30 kHz path. Values arrive as the BNO055's native integers; the scale
+     * factors are applied here so consumers get engineering units.
+     * `timestamp` is the PL master clock, so IMU samples align with
+     * broadband/LFP samples without host-side clock matching.
+     */
+    struct ImuSample {
+        uint64_t timestamp;        // PL master timestamp, latched at sample completion
+        uint32_t sequence;         // per-PORT SEQ (header w4) -- the loss check
+        int      port;             // 0 = A, 1 = B (header w1 bit 16)
+        float    quat[4];          // w, x, y, z (unit quaternion)
+        float    accel[3];         // x, y, z in m/s^2
+        float    gyro[3];          // x, y, z in deg/s
+        uint8_t  calibStatus;      // [7:6] sys [5:4] gyr [3:2] acc [1:0] mag; 3 = calibrated
+        uint8_t  operatingMode;    // BNO055 OPR_MODE (0x0C = NDOF)
+        int8_t   temperatureC;     // die temperature
+        uint16_t periodMs;         // configured sample period
+        uint8_t  iicErrors;        // board-side I2C error count (saturates at 255)
+        uint8_t  sendDrops;        // board-side UDP drop count (saturates at 255)
+    };
+
+    /**
+     * @brief Callback type for receiving an IMU sample (UNIFIED UDP port,
+     * stream_type = 4). Invoked from the demux thread.
+     */
+    using ImuDataCallback = std::function<void(const ImuSample&)>;
+
+    /**
      * @brief Callback type for error notifications
      *
      * @param errorMessage Human-readable error description
@@ -686,6 +717,52 @@ public:
      * the callback; copy what you need.
      */
     void setLfpDataCallback(LfpDataCallback callback);
+
+    /**
+     * @brief Register callback for IMU samples (UNIFIED port, stream_type = 4).
+     *
+     * Invoked from the demux thread once per fused sample per streaming port.
+     * The ImuSample is fully by-value, so it may be copied freely.
+     */
+    void setImuDataCallback(ImuDataCallback callback);
+
+    // ========================================================================
+    // IMU (BNO055 on the freed-CIPO I2C bus; acq_imu_* fabrics only)
+    // ========================================================================
+
+    /** Which headstage ports carry a BNO055 the board can stream. */
+    struct ImuPorts { bool portA = false; bool portB = false; };
+
+    /**
+     * @brief Probe both ports for a BNO055 (CMD_DETECT_IMU).
+     *
+     * Requires a fabric with the AXI IICs (acq_imu_* or scan); returns false
+     * on a fabric without them (the firmware refuses rather than hanging).
+     */
+    bool detectImu(ImuPorts& present);
+
+    /**
+     * @brief Start/stop continuous IMU streaming (CMD_IMU_STREAM).
+     *
+     * The port set is ABSOLUTE (both false = stop everything). Starting a
+     * port does a blocking ~50 ms NDOF entry on the board, so it is refused
+     * while acquisition is running -- call this BEFORE startAcquisition().
+     * Stopping is always allowed. A SET_CONFIG fabric swap auto-stops it.
+     *
+     * @param ports    which ports to stream
+     * @param periodMs sample period, 0 = default 10 ms (100 Hz); clamped 10..1000
+     * @param active   [out] what the board actually started (ports without an
+     *                 IIC, or with no responding BNO055, are dropped)
+     */
+    bool setImuStream(const ImuPorts& ports, uint32_t periodMs, ImuPorts& active);
+
+    /** IMU reception counters (per port; index 0 = A, 1 = B). */
+    struct ImuStats {
+        uint64_t samples[2] = {0, 0};
+        uint64_t seqGaps[2] = {0, 0};
+        uint64_t lostSamples[2] = {0, 0};
+    };
+    void getImuStats(ImuStats& stats) const;
 
     /**
      * @brief Register callback for error notifications

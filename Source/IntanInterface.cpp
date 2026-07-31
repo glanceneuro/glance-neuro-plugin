@@ -77,6 +77,13 @@ namespace {
     constexpr size_t   COMMON_HEADER_WORDS    = 8;   // the 8 shared header words
     constexpr uint8_t  STREAM_TYPE_BROADBAND  = 1;
     constexpr uint8_t  STREAM_TYPE_LFP        = 2;
+    constexpr uint8_t  STREAM_TYPE_IMU        = 4;   // BNO055 side channel (type 3 reserved)
+    // IMU packet: 8-word common header + 5 payload words (10 LE int16).
+    constexpr size_t   IMU_PACKET_BYTES       = 52;
+    // BNO055 fixed-point scale factors (data sheet section 3.6.4).
+    constexpr float    BNO055_QUAT_SCALE      = 1.0f / 16384.0f;
+    constexpr float    BNO055_ACCEL_SCALE     = 1.0f / 100.0f;   // -> m/s^2
+    constexpr float    BNO055_GYRO_SCALE      = 1.0f / 16.0f;    // -> deg/s
     constexpr uint8_t  STREAM_TYPE_WAVELET    = 3;   // reserved (follow-on branch)
 
     constexpr size_t CMD_PACKET_SIZE = 20;
@@ -144,7 +151,9 @@ namespace {
         CMD_LFP_ENABLE = 0x80,       // p1 = 0/1
         CMD_LFP_SET_PARAMS = 0x81,   // p1 ignored (decimation is structural), p2 = num_taps
         CMD_LFP_SET_CHANNELS = 0x82, // p1 = 8-bit lane mask
-        CMD_LFP_WRITE_COEF = 0x83    // p1 bit0 = clear-ptr-first, bit1 = stage (0=halfband,1=decimator); p2 = 18-bit signed coef
+        CMD_LFP_WRITE_COEF = 0x83,   // p1 bit0 = clear-ptr-first, bit1 = stage (0=halfband,1=decimator); p2 = 18-bit signed coef
+        CMD_DETECT_IMU = 0xB0,       // -> 12-byte {result_a, result_b, version}
+        CMD_IMU_STREAM = 0xB8        // p1 = port mask (absolute), p2 = period ms -> 12-byte reply
     };
     
     // ACK status codes
@@ -245,6 +254,13 @@ namespace {
     
     uint16_t unpackU16BE(const uint8_t* buf) {
         return (buf[0] << 8) | buf[1];
+    }
+
+    // Signed 16-bit little-endian (the IMU payload's native form). Built up
+    // through uint16_t so the sign conversion is implementation-defined
+    // nowhere: shifting into the sign bit of a signed type is not portable.
+    int16_t unpackI16LE(const uint8_t* buf) {
+        return (int16_t)(uint16_t)(buf[0] | (buf[1] << 8));
     }
 }
 
@@ -707,6 +723,50 @@ public:
     void setLfpDataCallback(LfpDataCallback callback) {
         std::lock_guard<std::mutex> lock(callbackMutex_);
         lfpDataCallback_ = callback;
+    }
+
+    void setImuDataCallback(ImuDataCallback callback) {
+        std::lock_guard<std::mutex> lock(callbackMutex_);
+        imuDataCallback_ = callback;
+    }
+
+    // IMU control. detectImu is a one-shot probe (refused by the firmware on a
+    // fabric without the AXI IICs, and while the IMU stream owns a port); the
+    // stream commands mirror net.py imu_stream().
+    bool detectImu(ImuPorts& present) {
+        uint8_t data[12];
+        size_t dataLen = sizeof(data);
+        if (!sendCommand(CMD_DETECT_IMU, 0, 0, data, &dataLen) || dataLen != 12)
+            return false;
+        // Result bit 0 = present (ACKed AND chip_id == 0xA0).
+        present.portA = (unpackU32LE(data) & 0x1) != 0;
+        present.portB = (unpackU32LE(data + 4) & 0x1) != 0;
+        return true;
+    }
+
+    bool setImuStream(const ImuPorts& ports, uint32_t periodMs, ImuPorts& active) {
+        uint32_t mask = (ports.portA ? 1u : 0u) | (ports.portB ? 2u : 0u);
+        uint8_t data[12];
+        size_t dataLen = sizeof(data);
+        if (!sendCommand(CMD_IMU_STREAM, mask, periodMs, data, &dataLen) || dataLen != 12)
+            return false;
+        uint32_t activeMask = unpackU32LE(data);
+        active.portA = (activeMask & 1) != 0;
+        active.portB = (activeMask & 2) != 0;
+        if (mask == 0) {   // a stop resets the loss check: SEQ restarts at 0
+            std::lock_guard<std::mutex> lock(statsMutex_);
+            imuHaveSeq_[0] = imuHaveSeq_[1] = false;
+        }
+        return true;
+    }
+
+    void getImuStats(ImuStats& stats) const {
+        std::lock_guard<std::mutex> lock(statsMutex_);
+        for (int p = 0; p < 2; ++p) {
+            stats.samples[p]     = imuSamples_[p];
+            stats.seqGaps[p]     = imuSeqGaps_[p];
+            stats.lostSamples[p] = imuLostSamples_[p];
+        }
     }
 
     void setErrorCallback(ErrorCallback callback) {
@@ -1448,9 +1508,87 @@ public:
             processBroadbandDatagram(data, len);
         } else if (streamType == STREAM_TYPE_LFP) {
             processLfpDatagram(data, len);
+        } else if (streamType == STREAM_TYPE_IMU) {
+            processImuDatagram(data, len);
         }
         // Other stream types (e.g. WAVELET=3) are silently ignored on this
         // branch -- they belong to the follow-on consumer.
+    }
+
+    // IMU sample (UNIFIED stream_type = 4). Unlike broadband/LFP this stream is
+    // built by the PS (its source is I2C, not a PL BRAM), one datagram per fused
+    // sample per port at 100 Hz. Layout (docs/unified-packet-format.md):
+    //   w0 MAGIC | w1 TYPE_VER (stream_type=4 | version<<8 | port<<16)
+    //   w2/w3 = 64-bit PL master timestamp (same clock as the neural data)
+    //   w4 = SEQ (PER PORT -- each port is its own stream)
+    //   w5 = AUX0 = period_ms | iic_errors<<16 | send_drops<<24
+    //   w6 = AUX1 = calib_stat | opr_mode<<8 | temp_c<<16
+    //   w8..w12 = 10 LE int16: quat w/x/y/z, acc x/y/z, gyr x/y/z
+    void processImuDatagram(const uint8_t* data, size_t len) {
+        if (len < IMU_PACKET_BYTES) {
+            std::lock_guard<std::mutex> lock(statsMutex_);
+            sizeErrors_++; totalErrors_++;
+            return;
+        }
+        static constexpr size_t HDR = COMMON_HEADER_WORDS * 4;
+
+        uint32_t typeVer = unpackU32LE(data + 4);
+        int port = (int)((typeVer >> 16) & 1);
+        uint32_t seq  = unpackU32LE(data + 16);
+        uint32_t aux0 = unpackU32LE(data + 20);
+        uint32_t aux1 = unpackU32LE(data + 24);
+
+        // Per-PORT SEQ continuity = the IMU loss check. The board never retries
+        // a failed send (a fresher sample is 10 ms out), so a forward gap is
+        // exactly that many lost samples. Same forward/backward discipline as
+        // the LFP path: a backward jump is a stream restart, not loss.
+        {
+            std::lock_guard<std::mutex> lock(statsMutex_);
+            if (imuHaveSeq_[port]) {
+                uint32_t delta = seq - (imuLastSeq_[port] + 1);
+                if (delta != 0 && delta < 0x80000000u) {
+                    imuSeqGaps_[port]++;
+                    imuLostSamples_[port] += delta;
+                    static thread_local std::chrono::steady_clock::time_point lastImuLoss{};
+                    auto nowTp = std::chrono::steady_clock::now();
+                    if (nowTp - lastImuLoss > std::chrono::seconds(1)) {
+                        lastImuLoss = nowTp;
+                        std::cout << "[IntanInterface][LOSS] IMU port "
+                                  << (port ? 'B' : 'A') << " SEQ gap: +" << delta
+                                  << " missing, gaps=" << imuSeqGaps_[port]
+                                  << " (throttled)" << std::endl;
+                    }
+                }
+            }
+            imuLastSeq_[port] = seq;
+            imuHaveSeq_[port] = true;
+            imuSamples_[port]++;
+        }
+
+        ImuSample sample;
+        sample.timestamp = (uint64_t)unpackU32LE(data + 8) |
+                           ((uint64_t)unpackU32LE(data + 12) << 32);
+        sample.sequence      = seq;
+        sample.port          = port;
+        sample.periodMs      = (uint16_t)(aux0 & 0xFFFF);
+        sample.iicErrors     = (uint8_t)((aux0 >> 16) & 0xFF);
+        sample.sendDrops     = (uint8_t)((aux0 >> 24) & 0xFF);
+        sample.calibStatus   = (uint8_t)(aux1 & 0xFF);
+        sample.operatingMode = (uint8_t)((aux1 >> 8) & 0xFF);
+        sample.temperatureC  = (int8_t)((aux1 >> 16) & 0xFF);
+        for (int i = 0; i < 4; ++i)
+            sample.quat[i]  = (float)unpackI16LE(data + HDR + 2 * i) * BNO055_QUAT_SCALE;
+        for (int i = 0; i < 3; ++i)
+            sample.accel[i] = (float)unpackI16LE(data + HDR + 8 + 2 * i) * BNO055_ACCEL_SCALE;
+        for (int i = 0; i < 3; ++i)
+            sample.gyro[i]  = (float)unpackI16LE(data + HDR + 14 + 2 * i) * BNO055_GYRO_SCALE;
+
+        ImuDataCallback cb;
+        {
+            std::lock_guard<std::mutex> lock(callbackMutex_);
+            cb = imuDataCallback_;
+        }
+        if (cb) cb(sample);
     }
 
     // LFP frame (UNIFIED stream_type = 2). The PL builds the whole wire packet
@@ -2017,6 +2155,13 @@ public:
     // Callbacks
     DataCallback dataCallback_;
     LfpDataCallback lfpDataCallback_;
+    ImuDataCallback imuDataCallback_;
+    // IMU reception state, per port (0 = A, 1 = B). Guarded by statsMutex_.
+    uint64_t imuSamples_[2]     = {0, 0};
+    uint64_t imuSeqGaps_[2]     = {0, 0};
+    uint64_t imuLostSamples_[2] = {0, 0};
+    uint32_t imuLastSeq_[2]     = {0, 0};
+    bool     imuHaveSeq_[2]     = {false, false};
     ErrorCallback errorCallback_;
     
     // Auto-detection
@@ -2161,6 +2306,23 @@ void IntanInterface::setDataCallback(DataCallback callback) {
 
 void IntanInterface::setLfpDataCallback(LfpDataCallback callback) {
     pImpl_->setLfpDataCallback(callback);
+}
+
+void IntanInterface::setImuDataCallback(ImuDataCallback callback) {
+    pImpl_->setImuDataCallback(callback);
+}
+
+bool IntanInterface::detectImu(ImuPorts& present) {
+    return pImpl_->detectImu(present);
+}
+
+bool IntanInterface::setImuStream(const ImuPorts& ports, uint32_t periodMs,
+                                  ImuPorts& active) {
+    return pImpl_->setImuStream(ports, periodMs, active);
+}
+
+void IntanInterface::getImuStats(ImuStats& stats) const {
+    pImpl_->getImuStats(stats);
 }
 
 void IntanInterface::setErrorCallback(ErrorCallback callback) {

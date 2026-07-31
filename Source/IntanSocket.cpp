@@ -190,6 +190,14 @@ bool IntanSocket::connectDevice(bool printOutput)
             }
         );
 
+        // IMU callback: one fused BNO055 sample per streaming port at 100 Hz.
+        // Always wired -- silently does nothing until a stream is started.
+        intanInterface->setImuDataCallback(
+            [this](const IntanInterface::ImuSample& s) {
+                processImuSample(s);
+            }
+        );
+
         // Set up error callback
         intanInterface->setErrorCallback(
             [this, printOutput](const std::string& error) {
@@ -266,6 +274,27 @@ bool IntanSocket::connectDevice(bool printOutput)
         // bitstream at boot and the decimation is structural, so any state the
         // firmware reports is a state it can actually stream in.
         applyLfpStatus(status);
+
+        // IMU: probe for a BNO055 on each port. This only succeeds on a fabric
+        // that carries the AXI IICs (acq_imu_*/scan) -- on a plain acquisition
+        // fabric the firmware refuses the command, which is a normal "no IMU
+        // here" answer, not an error. Nothing is started yet: arming a port
+        // does a blocking NDOF entry on the board, so it happens in
+        // startAcquisition() before the neural stream runs.
+        IntanInterface::ImuPorts present;
+        imu_enabled = imu_port_a = imu_port_b = false;
+        if (intanInterface->detectImu(present))
+        {
+            imu_port_a = present.portA;
+            imu_port_b = present.portB;
+            imu_enabled = imu_port_a || imu_port_b;
+            imu_num_channels = IMU_CHANS_PER_PORT *
+                               ((imu_port_a ? 1 : 0) + (imu_port_b ? 1 : 0));
+            if (printOutput && imu_enabled)
+                LOGC("Intan: BNO055 present on port",
+                     imu_port_a && imu_port_b ? "s A and B" : (imu_port_a ? " A" : " B"),
+                     " -- publishing IMU stream (", imu_num_channels, " channels @ 100 Hz)");
+        }
 
         // Fast-settle / TTL state: prefer the new aux_ctrl readback
         // (firmware 65d5fb5+) which surfaces the actual SW level and TTL
@@ -544,6 +573,68 @@ void IntanSocket::updateSettings(OwnedArray<ContinuousChannel>* continuousChanne
              ", decim=", (int)lfp_decim_R,
              ", taps=", (int)lfp_num_taps, ")");
     }
+
+    // ------------------------------------------------------------------
+    // THIRD stream: IMU (stream_type = 4), published only when a BNO055
+    // actually answered at connect time. 10 channels per streaming port --
+    // quaternion w/x/y/z (unitless), accel x/y/z (m/s^2), gyro x/y/z (deg/s)
+    // -- at the BNO055's 100 Hz fusion rate. This is a low-rate side channel;
+    // it shares the unified UDP port but never the 30 kHz path.
+    // ------------------------------------------------------------------
+    imu_buffer_index = -1;
+    if (imu_enabled && imu_num_channels > 0)
+    {
+        DataStream::Settings imuSettings{
+            "IMUStream",
+            "Headstage IMU (BNO055 fusion)",
+            "intan.data.imu",
+            IMU_SAMPLE_RATE,
+            generatesTimestamps
+        };
+        DataStream* imuStream = new DataStream(imuSettings);
+        sourceStreams->add(imuStream);
+
+        // The IMU buffer's slot depends on whether the LFP stream was
+        // published above -- sourceBuffers is indexed in publication order.
+        imu_buffer_index = sourceStreams->size() - 1;
+        int imuBufferSamples = (int)(IMU_SAMPLE_RATE * bufferSizeInSeconds);
+        if (imuBufferSamples < 1000) imuBufferSamples = 1000;  // 100 Hz: keep depth generous
+        while (sourceBuffers.size() <= imu_buffer_index)
+            sourceBuffers.add(new DataBuffer(imu_num_channels, imuBufferSamples));
+        sourceBuffers[imu_buffer_index]->resize(imu_num_channels, imuBufferSamples);
+
+        // Channel names carry the physical quantity and unit, so the value is
+        // readable in the GUI without consulting this source.
+        static const char* kAxisNames[IMU_CHANS_PER_PORT] = {
+            "QUAT_W", "QUAT_X", "QUAT_Y", "QUAT_Z",
+            "ACC_X", "ACC_Y", "ACC_Z", "GYR_X", "GYR_Y", "GYR_Z"
+        };
+        static const char* kAxisUnits[IMU_CHANS_PER_PORT] = {
+            "", "", "", "", "m/s^2", "m/s^2", "m/s^2", "deg/s", "deg/s", "deg/s"
+        };
+        for (int p = 0; p < 2; ++p)
+        {
+            if (p == 0 && !imu_port_a) continue;
+            if (p == 1 && !imu_port_b) continue;
+            String portPrefix = (p == 0) ? "IMU_A_" : "IMU_B_";
+            for (int k = 0; k < IMU_CHANS_PER_PORT; ++k)
+            {
+                ContinuousChannel::Settings is{
+                    ContinuousChannel::Type::AUX,
+                    portPrefix + kAxisNames[k],
+                    "Headstage IMU (BNO055 NDOF fusion)",
+                    "intan.continuous.imu",
+                    1.0f,               // samples already arrive in engineering units
+                    imuStream
+                };
+                continuousChannels->add(new ContinuousChannel(is));
+                continuousChannels->getLast()->setUnits(kAxisUnits[k]);
+            }
+        }
+
+        LOGC("Configured IMU stream: ", imu_num_channels, " channels @ 100 Hz (port",
+             imu_port_a && imu_port_b ? "s A+B)" : (imu_port_a ? " A)" : " B)"));
+    }
 }
 
 bool IntanSocket::foundInputSource()
@@ -636,7 +727,30 @@ bool IntanSocket::startAcquisition()
         LOGE("Failed to set loop count to infinite");
         return false;
     }
-    Thread::sleep(10);    
+    Thread::sleep(10);
+
+    // Arm the IMU stream BEFORE the neural stream. Starting a port does a
+    // blocking ~50 ms NDOF entry on the board, which the firmware refuses once
+    // acquisition is running -- so this ordering is required, not incidental.
+    // A failure here is not fatal to the recording: log it and stream neural
+    // data anyway (the IMU channels stay at their last values).
+    if (imu_enabled)
+    {
+        imuSampleCounter = 0;
+        imuConvBuf.assign((size_t)imu_num_channels, 0.0f);
+        IntanInterface::ImuPorts want, active;
+        want.portA = imu_port_a;
+        want.portB = imu_port_b;
+        if (!intanInterface->setImuStream(want, 0 /* default 100 Hz */, active))
+        {
+            LOGE("Intan: could not start the IMU stream (continuing without it)");
+        }
+        else if (active.portA != want.portA || active.portB != want.portB)
+        {
+            LOGE("Intan: IMU stream started on fewer ports than expected "
+                 "(A=", (int)active.portA, " B=", (int)active.portB, ")");
+        }
+    }
 
     // Start acquisition on device
     if (!intanInterface->startAcquisition())
@@ -662,10 +776,29 @@ bool IntanSocket::stopAcquisition()
     if (intanInterface)
     {
         intanInterface->stopAcquisition();
+
+        // Stop the IMU stream too: it has an independent lifecycle on the
+        // board (it survives a neural stop), but leaving it running would keep
+        // pushing samples into a stream Open Ephys has stopped reading.
+        // Stopping never blocks, so it is safe here.
+        if (imu_enabled)
+        {
+            IntanInterface::ImuPorts none, active;
+            intanInterface->setImuStream(none, 0, active);
+
+            IntanInterface::ImuStats istats;
+            intanInterface->getImuStats(istats);
+            if (istats.samples[0] || istats.samples[1])
+                LOGC("Intan IMU: ", (int)istats.samples[0], " samples port A / ",
+                     (int)istats.samples[1], " port B, SEQ gaps A=",
+                     (int)istats.seqGaps[0], " B=", (int)istats.seqGaps[1]);
+        }
     }
 
     sourceBuffers[0]->clear();
-    
+    if (imu_buffer_index > 0 && sourceBuffers.size() > imu_buffer_index)
+        sourceBuffers[imu_buffer_index]->clear();
+
     LOGC("Intan acquisition stopped");
     return true;
 }
@@ -734,6 +867,42 @@ void IntanSocket::processLfpFrame(const IntanInterface::LfpFrame& frame)
                                   &lfpTimestamp,
                                   &eventState,
                                   1);  // ONE time sample
+}
+
+void IntanSocket::processImuSample(const IntanInterface::ImuSample& sample)
+{
+    // Called from IntanInterface's demux thread. No stream published (no IMU
+    // at connect time, or the board started streaming a port we didn't
+    // publish) -> nothing to push into.
+    if (imu_buffer_index < 0 || imu_num_channels <= 0) return;
+    if (sourceBuffers.size() <= imu_buffer_index) return;
+    if (sample.port == 0 && !imu_port_a) return;
+    if (sample.port == 1 && !imu_port_b) return;
+
+    if ((int)imuConvBuf.size() != imu_num_channels)
+        imuConvBuf.assign((size_t)imu_num_channels, 0.0f);
+
+    // Each port owns a fixed 10-channel block; port A first when both stream.
+    // The two ports sample independently (staggered on the board), so a packet
+    // updates only its own block and the other port's last values are carried
+    // forward -- a sample-and-hold, which is the honest representation of two
+    // asynchronous sensors on one DataStream.
+    int base = (sample.port == 1 && imu_port_a) ? IMU_CHANS_PER_PORT : 0;
+    for (int i = 0; i < 4; ++i) imuConvBuf[base + i]     = sample.quat[i];
+    for (int i = 0; i < 3; ++i) imuConvBuf[base + 4 + i] = sample.accel[i];
+    for (int i = 0; i < 3; ++i) imuConvBuf[base + 7 + i] = sample.gyro[i];
+
+    // Sample numbers must be monotonic across the stream; the per-port SEQ is
+    // not (two ports interleave), so count pushes locally. The board's PL
+    // timestamp still rides along, which is what aligns IMU with neural data.
+    int64 imuSampleNumber = imuSampleCounter++;
+    double imuTimestamp = (double)sample.timestamp;
+
+    sourceBuffers[imu_buffer_index]->addToBuffer(imuConvBuf.data(),
+                                                 &imuSampleNumber,
+                                                 &imuTimestamp,
+                                                 &eventState,
+                                                 1);  // ONE time sample
 }
 
 bool IntanSocket::updateBuffer()

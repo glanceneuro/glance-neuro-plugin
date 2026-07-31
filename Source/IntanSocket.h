@@ -61,6 +61,26 @@ public:
     uint8_t lfp_num_taps = 0;
     int     lfp_num_channels = 0;   // popcount(lfp_lane_mask) * 32
 
+    // IMU state, established at connect-time by probing for a BNO055 (only
+    // an acq_imu_* fabric has one). A third DataStream carries 10 channels
+    // per streaming port: quat w/x/y/z, accel x/y/z, gyro x/y/z. Like LFP,
+    // the stream is published only if the hardware can actually feed it --
+    // an empty DataStream crashes downstream plugins.
+    bool imu_enabled = false;        // a BNO055 answered on at least one port
+    bool imu_port_a = false;
+    bool imu_port_b = false;
+    int  imu_num_channels = 0;       // 10 per streaming port
+    static constexpr int IMU_CHANS_PER_PORT = 10;
+    static constexpr float IMU_SAMPLE_RATE = 100.0f;   // BNO055 NDOF fusion rate
+    // Latest sample per port, held so a partial update (one port's packet)
+    // still pushes a full-width frame instead of zeroing the other port.
+    std::vector<float> imuConvBuf;
+    int64 imuSampleCounter = 0;
+    // Which sourceBuffers slot the IMU stream owns. sourceBuffers is indexed
+    // in DataStream publication order, and the LFP stream may or may not be
+    // published, so this cannot be a constant. -1 = no IMU stream published.
+    int imu_buffer_index = -1;
+
     /** Constructor */
     IntanSocket(SourceNode* sn);
 
@@ -185,6 +205,9 @@ private:
         sourceBuffers[1]. Each frame is one decimated sample per channel
         across `popcount(lane_mask) * 32` LFP channels. */
     void processLfpFrame(const IntanInterface::LfpFrame& frame);
+
+    /** Push one IMU sample into the third DataStream (stream_type = 4). */
+    void processImuSample(const IntanInterface::ImuSample& sample);
 
     /** Number of enabled 16-bit data streams in the 8-bit mask.
         Bits 0-3 = port A (A_CIPO0_REG, A_CIPO0_DDR, A_CIPO1_REG, A_CIPO1_DDR);
