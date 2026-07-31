@@ -743,10 +743,10 @@ public:
      */
     enum class FabricConfig : uint32_t {
         Acquisition  = 0,   // 128-ch LVDS on both cables, no IMU
-        Scan         = 1,   // non-acquisition I2C probe fabric (both ports)
-        AcqImuBoth   = 2,   // 64-ch + IMU on both cables
-        AcqImuPortA  = 3,   // port A 64-ch + IMU, port B 128-ch LVDS
-        AcqImuPortB  = 4    // port A 128-ch LVDS, port B 64-ch + IMU
+        AcqImuBoth   = 1,   // 64-ch + IMU on both cables; the only fabric with
+                            // I2C on BOTH ports, so the census runs here
+        AcqImuPortA  = 2,   // port A 64-ch + IMU, port B 128-ch LVDS
+        AcqImuPortB  = 3    // port A 128-ch LVDS, port B 64-ch + IMU
     };
 
     /**

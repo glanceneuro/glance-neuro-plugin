@@ -817,10 +817,12 @@ public:
     bool rescanFabric(ImuPorts& present) {
         present.portA = present.portB = false;
 
-        // The census has to happen on the scan fabric: it is the only one with
+        // The census has to happen on acq_imu_both: it is the only fabric with
         // I2C on BOTH ports, so an acq_imu_port_a fabric could never see a
-        // headstage newly plugged into port B.
-        if (setConfig(FabricConfig::Scan) && detectImu(present)) {
+        // headstage newly plugged into port B. It is also an acquisition
+        // fabric with the UART routed, so the board's console stays alive
+        // through the census.
+        if (setConfig(FabricConfig::AcqImuBoth) && detectImu(present)) {
             std::cout << "[GLANCE] IMU census: port A "
                       << (present.portA ? "yes" : "no") << ", port B "
                       << (present.portB ? "yes" : "no") << std::endl;
@@ -834,11 +836,12 @@ public:
             present.portA                    ? FabricConfig::AcqImuPortA :
             present.portB                    ? FabricConfig::AcqImuPortB :
                                                FabricConfig::Acquisition;
-        if (!setConfig(target)) {
+        // Already on it when both ports answered -- skip the redundant load.
+        if (target != FabricConfig::AcqImuBoth && !setConfig(target)) {
             reportError("Could not load an acquisition fabric onto the board");
             return false;
         }
-        std::cout << "[GLANCE] loaded fabric " << (int)target
+        std::cout << "[GLANCE] fabric " << (int)target
                   << " -- board ready to acquire" << std::endl;
         return true;
     }
