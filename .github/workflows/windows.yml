@@ -8,11 +8,21 @@ on:
 
 jobs:
   build-windows:
-    runs-on: [windows-latest]
+    # PINNED, not windows-latest. The generator below is "Visual Studio 17 2022",
+    # and windows-latest has moved to an image that ships a different Visual
+    # Studio -- cmake then fails setup with "could not find any instance of
+    # Visual Studio" before any of our code is compiled.
+    #
+    # Pinning is preferred over bumping the generator because the setup step
+    # downloads open-ephys-lib-v1.0.0.zip, a PREBUILT binary. Building against a
+    # newer MSVC toolset risks a link failure against that lib, which is a much
+    # more confusing symptom than this one. If this image is ever retired, bump
+    # the runner and the generator together and check that the lib still links.
+    runs-on: [windows-2022]
 
     steps:
     - name: Checkout
-      uses: actions/checkout@v4
+      uses: actions/checkout@v5
 
     - name: setup
       run: |
@@ -31,6 +41,10 @@ jobs:
         cmake -G "Visual Studio 17 2022" -A x64 ..
       shell: bash
 
+    # Still on the Node 20 runtime, hence the deprecation warning on this job.
+    # Left pinned deliberately: a newer major may not exist, and an invalid tag
+    # turns a warning into a hard failure. Bump only after checking the
+    # marketplace.
     - name: Add msbuild to PATH
       uses: microsoft/setup-msbuild@v2
 
