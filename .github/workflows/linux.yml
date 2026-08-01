@@ -1,14 +1,22 @@
+# Build-only CI. There is deliberately NO deploy step.
+#
+# This repo is a fork of open-ephys/ephys-socket, and the upstream workflows end
+# by uploading to openephys.jfrog.io/artifactory/EphysSocket-plugin/... using
+# secrets.ARTIFACTORY_ACCESS_TOKEN -- an Open Ephys org credential, under their
+# package name. That is their release pipeline, not ours: running it here would
+# publish GLANCE builds into their artifact namespace. If you ever sync a
+# workflow from upstream, drop the deploy step again.
+#
+# What these jobs are for: proving the plugin still compiles. All three platforms
+# are kept because Source/IntanInterface.cpp carries real _WIN32 and __APPLE__
+# branches (winsock2 vs POSIX sockets, closesocket, the Apple-specific paths in
+# IntanSocket.cpp) that a Linux-only build cannot exercise.
 name: linux
 
-on: 
+on:
   push:
     branches: [main]
   pull_request:
-    
-env:
-  ARTIFACTORY_ACCESS_TOKEN: ${{ secrets.ARTIFACTORY_ACCESS_TOKEN }}
-  build_dir: "Build"
-  package: EphysSocket-linux
 
 jobs:
   build-linux:
@@ -27,20 +35,7 @@ jobs:
         cd plugin-GUI/Build && cmake -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release ..
 
     - name: build
-      id: build
       run: |
         cd Build
         cmake -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release ..
         make
-
-    - name: deploy
-      if: github.ref == 'refs/heads/main' && steps.build.outcome == 'success'
-      run: |
-        plugin_api=$(grep -rnw ../../plugin-GUI/Source -e '#define PLUGIN_API_VER' | grep -Eo "[0-9]*" | tail -1)
-        tag=$(grep -w Source/OpenEphysLib.cpp -e 'info->libVersion' | grep -Eo "[0-9]+.[0-9]+.[0-9]+")
-        new_plugin_ver=$tag-API$plugin_api
-        mkdir plugins 
-        cp -r $build_dir/*.so plugins
-        zipfile=${package}_${new_plugin_ver}.zip
-        zip -r -X $zipfile plugins
-        curl -H "X-JFrog-Art-Api:$ARTIFACTORY_ACCESS_TOKEN" -T $zipfile "https://openephys.jfrog.io/artifactory/EphysSocket-plugin/linux/$zipfile"
