@@ -77,6 +77,16 @@ namespace {
     constexpr size_t   COMMON_HEADER_WORDS    = 8;   // the 8 shared header words
     constexpr uint8_t  STREAM_TYPE_BROADBAND  = 1;
     constexpr uint8_t  STREAM_TYPE_LFP        = 2;
+    constexpr uint8_t  STREAM_TYPE_IMU        = 3;   // BNO055 side channel
+    // A fabric swap reads a ~4 MB bitstream off the SD card and programs the
+    // PL through PCAP. net.py allows 15 s for the same command.
+    constexpr uint32_t kFabricLoadTimeoutMs   = 20000;
+    // IMU packet: 8-word common header + 5 payload words (10 LE int16).
+    constexpr size_t   IMU_PACKET_BYTES       = 52;
+    // BNO055 fixed-point scale factors (data sheet section 3.6.4).
+    constexpr float    BNO055_QUAT_SCALE      = 1.0f / 16384.0f;
+    constexpr float    BNO055_ACCEL_SCALE     = 1.0f / 100.0f;   // -> m/s^2
+    constexpr float    BNO055_GYRO_SCALE      = 1.0f / 16.0f;    // -> deg/s
     constexpr uint8_t  STREAM_TYPE_WAVELET    = 3;   // reserved (follow-on branch)
 
     constexpr size_t CMD_PACKET_SIZE = 20;
@@ -144,7 +154,11 @@ namespace {
         CMD_LFP_ENABLE = 0x80,       // p1 = 0/1
         CMD_LFP_SET_PARAMS = 0x81,   // p1 ignored (decimation is structural), p2 = num_taps
         CMD_LFP_SET_CHANNELS = 0x82, // p1 = 8-bit lane mask
-        CMD_LFP_WRITE_COEF = 0x83    // p1 bit0 = clear-ptr-first, bit1 = stage (0=halfband,1=decimator); p2 = 18-bit signed coef
+        CMD_LFP_WRITE_COEF = 0x83,   // p1 bit0 = clear-ptr-first, bit1 = stage (0=halfband,1=decimator); p2 = 18-bit signed coef
+        CMD_DETECT_IMU = 0xB0,       // -> 12-byte {result_a, result_b, version}
+        CMD_SET_CONFIG = 0xB4,       // p1 = fabric selector; PCAP-swaps the whole PL
+        CMD_PL_STATUS  = 0xB5,       // -> {int32 config, uint32 flags}; works in ANY state
+        CMD_IMU_STREAM = 0xB8        // p1 = port mask (absolute), p2 = period ms -> 12-byte reply
     };
     
     // ACK status codes
@@ -246,6 +260,13 @@ namespace {
     uint16_t unpackU16BE(const uint8_t* buf) {
         return (buf[0] << 8) | buf[1];
     }
+
+    // Signed 16-bit little-endian (the IMU payload's native form). Built up
+    // through uint16_t so the sign conversion is implementation-defined
+    // nowhere: shifting into the sign bit of a signed type is not portable.
+    int16_t unpackI16LE(const uint8_t* buf) {
+        return (int16_t)(uint16_t)(buf[0] | (buf[1] << 8));
+    }
 }
 
 // ============================================================================
@@ -289,6 +310,13 @@ public:
         }
         
         // Auto-configure UDP destination
+        // Make sure an acquisition fabric is live FIRST. The board normally
+        // boots with one already configured by the FSBL, but a PL that is blank
+        // (bitstream omitted from BOOT.bin, or a failed swap) refuses every
+        // command touching acquisition registers -- which reads as a dead board:
+        // the UDP destination is NACKed and the initial getStatus fails.
+        ensureAcquisitionFabric();
+
         autoConfigureUdp();
 
         // Start the UNIFIED UDP listener: ONE socket on udpPort_ (0x6800) carries
@@ -310,14 +338,14 @@ public:
         DeviceStatus status;
         if (getStatusInternal(status)) {
             updateChannelEnable(status.channelEnable);
-            std::cout << "[IntanInterface] firmware reports udp_dest "
+            std::cout << "[GLANCE] firmware reports udp_dest "
                       << status.udpDestIp << ":" << status.udpDestPort
                       << ", channel_enable=0x" << std::hex
                       << static_cast<int>(status.channelEnable) << std::dec
                       << ", fw " << status.getFirmwareVersionString()
                       << std::endl;
         } else {
-            std::cout << "[IntanInterface] WARN: initial getStatus failed"
+            std::cout << "[GLANCE] WARN: initial getStatus failed"
                       << std::endl;
         }
     }
@@ -374,14 +402,50 @@ public:
         return !status.transmissionActive;
     }
     
+    // Raise the receive timeout for the life of one command, then put it back.
+    // Almost every command answers in microseconds, so the socket's default is
+    // deliberately short; a fabric swap is the exception -- it reads megabytes
+    // off the SD card and programs the PL, taking seconds.
+    struct ScopedRecvTimeout {
+        SOCKET sock;
+        bool applied = false;
+        ScopedRecvTimeout(SOCKET s, uint32_t ms) : sock(s) {
+            if (ms == 0 || s == INVALID_SOCKET) return;
+#ifdef _WIN32
+            DWORD tv = ms;
+#else
+            struct timeval tv;
+            tv.tv_sec  = (long)(ms / 1000);
+            tv.tv_usec = (long)((ms % 1000) * 1000);
+#endif
+            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
+                       reinterpret_cast<const char*>(&tv), sizeof(tv));
+            applied = true;
+        }
+        ~ScopedRecvTimeout() {
+            if (!applied) return;
+#ifdef _WIN32
+            DWORD tv = 3000;
+#else
+            struct timeval tv;
+            tv.tv_sec = 3; tv.tv_usec = 0;
+#endif
+            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
+                       reinterpret_cast<const char*>(&tv), sizeof(tv));
+        }
+    };
+
     bool sendCommand(CommandId cmdId, uint32_t param1 = 0, uint32_t param2 = 0,
-                     uint8_t* responseData = nullptr, size_t* responseLen = nullptr) {
+                     uint8_t* responseData = nullptr, size_t* responseLen = nullptr,
+                     uint32_t timeoutMs = 0) {
         std::lock_guard<std::mutex> lock(tcpMutex_);
-        
+
         if (tcpSocket_ == INVALID_SOCKET) {
             return false;
         }
-        
+
+        ScopedRecvTimeout recvTimeout(tcpSocket_, timeoutMs);
+
         // Build command packet
         uint8_t cmd[CMD_PACKET_SIZE];
         static uint32_t ackId = 1;
@@ -709,6 +773,133 @@ public:
         lfpDataCallback_ = callback;
     }
 
+    void setImuDataCallback(ImuDataCallback callback) {
+        std::lock_guard<std::mutex> lock(callbackMutex_);
+        imuDataCallback_ = callback;
+    }
+
+    // --- PL fabric (deferred boot) ------------------------------------------
+    // The board boots with the default acquisition fabric configured by the
+    // FSBL and swaps to others on command, so which fabric is live is a runtime
+    // property to ask about, not assume. If the PL is blank -- bitstream omitted
+    // or a swap failed -- every command touching acquisition registers is
+    // refused, so "connected" and "able to acquire" can still differ.
+    bool plStatus(int& config, bool& isAcq) {
+        uint8_t data[8];
+        size_t dataLen = sizeof(data);
+        if (!sendCommand(CMD_PL_STATUS, 0, 0, data, &dataLen) || dataLen < 8)
+            return false;
+        config = (int)unpackU32LE(data);
+        isAcq  = (unpackU32LE(data + 4) & 0x1) != 0;
+        return true;
+    }
+
+    // PCAP-swap the fabric. Multi-megabyte SD read + programming, so this is
+    // seconds, not milliseconds -- the command socket's normal timeout is far
+    // too short and the caller must expect to wait.
+    bool setConfig(FabricConfig cfg) {
+        uint8_t data[12];
+        size_t dataLen = sizeof(data);
+        if (!sendCommand(CMD_SET_CONFIG, (uint32_t)cfg, 0, data, &dataLen,
+                         kFabricLoadTimeoutMs))
+            return false;
+        if (dataLen < 12) return false;
+        return (int32_t)unpackU32LE(data) == 0;      // rc == 0
+    }
+
+    // Census the IMUs and load the acquisition fabric that matches what is
+    // actually plugged in. Always does the full dance, whatever is loaded now --
+    // this is what RESCAN means, and it is the only way a headstage swapped
+    // since connect gets noticed.
+    bool rescanFabric(ImuPorts& present) {
+        present.portA = present.portB = false;
+
+        // The census has to happen on acq_imu_both: it is the only fabric with
+        // I2C on BOTH ports, so an acq_imu_port_a fabric could never see a
+        // headstage newly plugged into port B. It is also an acquisition
+        // fabric with the UART routed, so the board's console stays alive
+        // through the census.
+        if (setConfig(FabricConfig::AcqImuBoth) && detectImu(present)) {
+            std::cout << "[GLANCE] IMU census: port A "
+                      << (present.portA ? "yes" : "no") << ", port B "
+                      << (present.portB ? "yes" : "no") << std::endl;
+        } else {
+            std::cout << "[GLANCE] IMU census unavailable; assuming no IMUs"
+                      << std::endl;
+        }
+
+        FabricConfig target =
+            (present.portA && present.portB) ? FabricConfig::AcqImuBoth :
+            present.portA                    ? FabricConfig::AcqImuPortA :
+            present.portB                    ? FabricConfig::AcqImuPortB :
+                                               FabricConfig::Acquisition;
+        // Already on it when both ports answered -- skip the redundant load.
+        if (target != FabricConfig::AcqImuBoth && !setConfig(target)) {
+            reportError("Could not load an acquisition fabric onto the board");
+            return false;
+        }
+        std::cout << "[GLANCE] fabric " << (int)target
+                  << " -- board ready to acquire" << std::endl;
+        return true;
+    }
+
+    bool ensureAcquisitionFabric() {
+        int config = -1;
+        bool isAcq = false;
+        if (!plStatus(config, isAcq)) {
+            // No PL_STATUS at all: firmware without the deferred-boot loader.
+            // Nothing to arrange -- let the caller proceed as it always did.
+            return true;
+        }
+        if (isAcq)
+            return true;
+
+        std::cout << "[GLANCE] board has no acquisition fabric loaded (PL is "
+                  << (config < 0 ? "blank" : "on a non-acquisition fabric")
+                  << "); bringing one up..." << std::endl;
+        ImuPorts present;
+        return rescanFabric(present);
+    }
+
+    // IMU control. detectImu is a one-shot probe (refused by the firmware on a
+    // fabric without the AXI IICs, and while the IMU stream owns a port); the
+    // stream commands mirror net.py imu_stream().
+    bool detectImu(ImuPorts& present) {
+        uint8_t data[12];
+        size_t dataLen = sizeof(data);
+        if (!sendCommand(CMD_DETECT_IMU, 0, 0, data, &dataLen) || dataLen != 12)
+            return false;
+        // Result bit 0 = present (ACKed AND chip_id == 0xA0).
+        present.portA = (unpackU32LE(data) & 0x1) != 0;
+        present.portB = (unpackU32LE(data + 4) & 0x1) != 0;
+        return true;
+    }
+
+    bool setImuStream(const ImuPorts& ports, uint32_t periodMs, ImuPorts& active) {
+        uint32_t mask = (ports.portA ? 1u : 0u) | (ports.portB ? 2u : 0u);
+        uint8_t data[12];
+        size_t dataLen = sizeof(data);
+        if (!sendCommand(CMD_IMU_STREAM, mask, periodMs, data, &dataLen) || dataLen != 12)
+            return false;
+        uint32_t activeMask = unpackU32LE(data);
+        active.portA = (activeMask & 1) != 0;
+        active.portB = (activeMask & 2) != 0;
+        if (mask == 0) {   // a stop resets the loss check: SEQ restarts at 0
+            std::lock_guard<std::mutex> lock(statsMutex_);
+            imuHaveSeq_[0] = imuHaveSeq_[1] = false;
+        }
+        return true;
+    }
+
+    void getImuStats(ImuStats& stats) const {
+        std::lock_guard<std::mutex> lock(statsMutex_);
+        for (int p = 0; p < 2; ++p) {
+            stats.samples[p]     = imuSamples_[p];
+            stats.seqGaps[p]     = imuSeqGaps_[p];
+            stats.lostSamples[p] = imuLostSamples_[p];
+        }
+    }
+
     void setErrorCallback(ErrorCallback callback) {
         std::lock_guard<std::mutex> lock(callbackMutex_);
         errorCallback_ = callback;
@@ -1002,7 +1193,7 @@ public:
             const bool pending = (err == EINPROGRESS || err == EWOULDBLOCK);
 #endif
             if (!pending) {
-                std::cout << "[IntanInterface] connectTcp: connect() failed err="
+                std::cout << "[GLANCE] connectTcp: connect() failed err="
                           << err
 #ifndef _WIN32
                           << " (" << std::strerror(err) << ")"
@@ -1026,7 +1217,7 @@ public:
             tvc.tv_usec = 0;
             int sel = select((int)tcpSocket_ + 1, nullptr, &wfds, &efds, &tvc);
             if (sel < 0) {
-                std::cout << "[IntanInterface] connectTcp: select() error errno="
+                std::cout << "[GLANCE] connectTcp: select() error errno="
                           << errno << std::endl;
                 closesocket(tcpSocket_);
                 tcpSocket_ = INVALID_SOCKET;
@@ -1036,7 +1227,7 @@ public:
                 // Timeout. The board isn't listening yet -- most common cause
                 // is trying to CONNECT before the Zynq's lwIP stack is up
                 // (~5-20 s after boot). Try again in a couple seconds.
-                std::cout << "[IntanInterface] connectTcp: connect timeout after "
+                std::cout << "[GLANCE] connectTcp: connect timeout after "
                           << CONNECT_TIMEOUT_SEC << "s to " << deviceIp_
                           << ":" << tcpPort_
                           << " (board still booting? retry in a few seconds)"
@@ -1053,7 +1244,7 @@ public:
             int goe = getsockopt(tcpSocket_, SOL_SOCKET, SO_ERROR,
                                  reinterpret_cast<char*>(&soerr), &soerrlen);
             if (goe != 0 || soerr != 0) {
-                std::cout << "[IntanInterface] connectTcp: SO_ERROR="
+                std::cout << "[GLANCE] connectTcp: SO_ERROR="
                           << soerr
 #ifndef _WIN32
                           << " (" << std::strerror(soerr) << ")"
@@ -1105,7 +1296,7 @@ public:
         // Get local IP that can reach device
         SOCKET tempSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (tempSock == INVALID_SOCKET) {
-            std::cout << "[IntanInterface] autoConfigureUdp: socket() failed" << std::endl;
+            std::cout << "[GLANCE] autoConfigureUdp: socket() failed" << std::endl;
             return;
         }
 
@@ -1128,14 +1319,14 @@ public:
                 // Configure device to send UDP to us
                 uint32_t ipInt = stringToIp(localIp);
                 ok = sendCommand(CMD_SET_UDP_DEST, ntohl(ipInt), udpPort_);
-                std::cout << "[IntanInterface] autoConfigureUdp: telling device to send UDP to "
+                std::cout << "[GLANCE] autoConfigureUdp: telling device to send UDP to "
                           << localIp << ":" << udpPort_
                           << (ok ? "  (ACKed)" : "  (NACKed!)") << std::endl;
             } else {
-                std::cout << "[IntanInterface] autoConfigureUdp: getsockname failed" << std::endl;
+                std::cout << "[GLANCE] autoConfigureUdp: getsockname failed" << std::endl;
             }
         } else {
-            std::cout << "[IntanInterface] autoConfigureUdp: connect() to "
+            std::cout << "[GLANCE] autoConfigureUdp: connect() to "
                       << deviceIp_ << ":" << tcpPort_ << " failed" << std::endl;
         }
 
@@ -1195,7 +1386,7 @@ public:
             // Log ONCE per thread (recv + demux) so it's visible whether RT engaged.
             static std::atomic<int> rtLogged { 0 };
             if (rtLogged.fetch_add(1) < 2)
-                std::cout << "[IntanInterface] recv/demux real-time scheduling: "
+                std::cout << "[GLANCE] recv/demux real-time scheduling: "
                           << (kr == KERN_SUCCESS ? "ENABLED (time-constraint)"
                                                  : "REJECTED -> QoS fallback")
                           << " (kr=" << (int)kr << ")" << std::endl;
@@ -1216,7 +1407,7 @@ public:
         raiseThreadPriority();
         udpSocket_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (udpSocket_ == INVALID_SOCKET) {
-            std::cout << "[IntanInterface] UDP listener: socket() failed" << std::endl;
+            std::cout << "[GLANCE] UDP listener: socket() failed" << std::endl;
             reportError("Failed to create UDP socket");
             return;
         }
@@ -1242,14 +1433,14 @@ public:
         if (getsockopt(udpSocket_, SOL_SOCKET, SO_RCVBUF,
                        reinterpret_cast<char*>(&gotbuf), &gotlen) == 0) {
             // Linux reports double the value it actually reserves.
-            std::cout << "[IntanInterface] UDP SO_RCVBUF = " << (gotbuf / 1024)
+            std::cout << "[GLANCE] UDP SO_RCVBUF = " << (gotbuf / 1024)
                       << " KB (requested " << (rcvbuf / 1024) << " KB)" << std::endl;
             // If the OS clamped it well below the request, the kernel drops UDP
             // under any brief stall -> broadband SEQ gaps that net.py (on a box
             // with a larger granted buffer) never sees. Surface it loudly with
             // the exact fix so it isn't silently the cause.
             if (gotbuf < rcvbuf) {
-                std::cout << "[IntanInterface] WARNING: SO_RCVBUF was CLAMPED to "
+                std::cout << "[GLANCE] WARNING: SO_RCVBUF was CLAMPED to "
                           << (gotbuf / 1024) << " KB (< requested " << (rcvbuf / 1024)
                           << " KB). Raise the OS limit to avoid UDP drops under load: "
                           << "macOS  'sudo sysctl -w kern.ipc.maxsockbuf=33554432' ; "
@@ -1267,7 +1458,7 @@ public:
 
         if (bind(udpSocket_, reinterpret_cast<struct sockaddr*>(&bindAddr),
                 sizeof(bindAddr)) == SOCKET_ERROR) {
-            std::cout << "[IntanInterface] UDP listener: bind to port "
+            std::cout << "[GLANCE] UDP listener: bind to port "
                       << udpPort_ << " FAILED (errno=" << errno << ")" << std::endl;
             reportError("Failed to bind UDP socket");
             closesocket(udpSocket_);
@@ -1275,7 +1466,7 @@ public:
             return;
         }
 
-        std::cout << "[IntanInterface] Unified UDP listener bound on port "
+        std::cout << "[GLANCE] Unified UDP listener bound on port "
                   << udpPort_ << " (demux by stream_type: broadband + LFP on one port)"
                   << std::endl;
 
@@ -1407,7 +1598,7 @@ public:
                     { std::lock_guard<std::mutex> lock(ringMutex_);
                       rd = ringDrops_; ringSz = ring_.size(); }
                     if (rd != lastRingDrops) {
-                        std::cout << "[IntanInterface][DROP] recv->demux ring overflow: "
+                        std::cout << "[GLANCE][DROP] recv->demux ring overflow: "
                                   << "ringDrops=" << rd << " (+" << (rd - lastRingDrops)
                                   << "/5s), ring depth=" << ringSz << "/" << kRingMax
                                   << " -- demux starved; SEQ gaps originate HERE" << std::endl;
@@ -1448,9 +1639,87 @@ public:
             processBroadbandDatagram(data, len);
         } else if (streamType == STREAM_TYPE_LFP) {
             processLfpDatagram(data, len);
+        } else if (streamType == STREAM_TYPE_IMU) {
+            processImuDatagram(data, len);
         }
         // Other stream types (e.g. WAVELET=3) are silently ignored on this
         // branch -- they belong to the follow-on consumer.
+    }
+
+    // IMU sample (UNIFIED stream_type = 3). Unlike broadband/LFP this stream is
+    // built by the PS (its source is I2C, not a PL BRAM), one datagram per fused
+    // sample per port at 100 Hz. Layout (docs/unified-packet-format.md):
+    //   w0 MAGIC | w1 TYPE_VER (stream_type=3 | version<<8 | port<<16)
+    //   w2/w3 = 64-bit PL master timestamp (same clock as the neural data)
+    //   w4 = SEQ (PER PORT -- each port is its own stream)
+    //   w5 = AUX0 = period_ms | iic_errors<<16 | send_drops<<24
+    //   w6 = AUX1 = calib_stat | opr_mode<<8 | temp_c<<16
+    //   w8..w12 = 10 LE int16: quat w/x/y/z, acc x/y/z, gyr x/y/z
+    void processImuDatagram(const uint8_t* data, size_t len) {
+        if (len < IMU_PACKET_BYTES) {
+            std::lock_guard<std::mutex> lock(statsMutex_);
+            sizeErrors_++; totalErrors_++;
+            return;
+        }
+        static constexpr size_t HDR = COMMON_HEADER_WORDS * 4;
+
+        uint32_t typeVer = unpackU32LE(data + 4);
+        int port = (int)((typeVer >> 16) & 1);
+        uint32_t seq  = unpackU32LE(data + 16);
+        uint32_t aux0 = unpackU32LE(data + 20);
+        uint32_t aux1 = unpackU32LE(data + 24);
+
+        // Per-PORT SEQ continuity = the IMU loss check. The board never retries
+        // a failed send (a fresher sample is 10 ms out), so a forward gap is
+        // exactly that many lost samples. Same forward/backward discipline as
+        // the LFP path: a backward jump is a stream restart, not loss.
+        {
+            std::lock_guard<std::mutex> lock(statsMutex_);
+            if (imuHaveSeq_[port]) {
+                uint32_t delta = seq - (imuLastSeq_[port] + 1);
+                if (delta != 0 && delta < 0x80000000u) {
+                    imuSeqGaps_[port]++;
+                    imuLostSamples_[port] += delta;
+                    static thread_local std::chrono::steady_clock::time_point lastImuLoss{};
+                    auto nowTp = std::chrono::steady_clock::now();
+                    if (nowTp - lastImuLoss > std::chrono::seconds(1)) {
+                        lastImuLoss = nowTp;
+                        std::cout << "[GLANCE][LOSS] IMU port "
+                                  << (port ? 'B' : 'A') << " SEQ gap: +" << delta
+                                  << " missing, gaps=" << imuSeqGaps_[port]
+                                  << " (throttled)" << std::endl;
+                    }
+                }
+            }
+            imuLastSeq_[port] = seq;
+            imuHaveSeq_[port] = true;
+            imuSamples_[port]++;
+        }
+
+        ImuSample sample;
+        sample.timestamp = (uint64_t)unpackU32LE(data + 8) |
+                           ((uint64_t)unpackU32LE(data + 12) << 32);
+        sample.sequence      = seq;
+        sample.port          = port;
+        sample.periodMs      = (uint16_t)(aux0 & 0xFFFF);
+        sample.iicErrors     = (uint8_t)((aux0 >> 16) & 0xFF);
+        sample.sendDrops     = (uint8_t)((aux0 >> 24) & 0xFF);
+        sample.calibStatus   = (uint8_t)(aux1 & 0xFF);
+        sample.operatingMode = (uint8_t)((aux1 >> 8) & 0xFF);
+        sample.temperatureC  = (int8_t)((aux1 >> 16) & 0xFF);
+        for (int i = 0; i < 4; ++i)
+            sample.quat[i]  = (float)unpackI16LE(data + HDR + 2 * i) * BNO055_QUAT_SCALE;
+        for (int i = 0; i < 3; ++i)
+            sample.accel[i] = (float)unpackI16LE(data + HDR + 8 + 2 * i) * BNO055_ACCEL_SCALE;
+        for (int i = 0; i < 3; ++i)
+            sample.gyro[i]  = (float)unpackI16LE(data + HDR + 14 + 2 * i) * BNO055_GYRO_SCALE;
+
+        ImuDataCallback cb;
+        {
+            std::lock_guard<std::mutex> lock(callbackMutex_);
+            cb = imuDataCallback_;
+        }
+        if (cb) cb(sample);
     }
 
     // LFP frame (UNIFIED stream_type = 2). The PL builds the whole wire packet
@@ -1507,7 +1776,7 @@ public:
                     auto nowTp = std::chrono::steady_clock::now();
                     if (nowTp - lastLfpLoss > std::chrono::seconds(1)) {
                         lastLfpLoss = nowTp;
-                        std::cout << "[IntanInterface][LOSS] LFP SEQ gap: expected "
+                        std::cout << "[GLANCE][LOSS] LFP SEQ gap: expected "
                                   << expectedSeq << ", got " << seq << " (+" << delta
                                   << " missing). lfp_seq_gaps=" << lfpSeqGaps_
                                   << " (throttled)" << std::endl;
@@ -1628,7 +1897,7 @@ public:
                 auto nowTp = std::chrono::steady_clock::now();
                 if (nowTp - lastBbLoss > std::chrono::seconds(1)) {
                     lastBbLoss = nowTp;
-                    std::cout << "[IntanInterface][LOSS] Broadband SEQ gap: expected "
+                    std::cout << "[GLANCE][LOSS] Broadband SEQ gap: expected "
                               << expectedSeq << ", got " << seq << " (+" << delta
                               << " missing). bb_seq_gaps=" << seqGaps_
                               << " (throttled)" << std::endl;
@@ -2017,6 +2286,13 @@ public:
     // Callbacks
     DataCallback dataCallback_;
     LfpDataCallback lfpDataCallback_;
+    ImuDataCallback imuDataCallback_;
+    // IMU reception state, per port (0 = A, 1 = B). Guarded by statsMutex_.
+    uint64_t imuSamples_[2]     = {0, 0};
+    uint64_t imuSeqGaps_[2]     = {0, 0};
+    uint64_t imuLostSamples_[2] = {0, 0};
+    uint32_t imuLastSeq_[2]     = {0, 0};
+    bool     imuHaveSeq_[2]     = {false, false};
     ErrorCallback errorCallback_;
     
     // Auto-detection
@@ -2161,6 +2437,39 @@ void IntanInterface::setDataCallback(DataCallback callback) {
 
 void IntanInterface::setLfpDataCallback(LfpDataCallback callback) {
     pImpl_->setLfpDataCallback(callback);
+}
+
+void IntanInterface::setImuDataCallback(ImuDataCallback callback) {
+    pImpl_->setImuDataCallback(callback);
+}
+
+bool IntanInterface::detectImu(ImuPorts& present) {
+    return pImpl_->detectImu(present);
+}
+
+bool IntanInterface::plStatus(int& config, bool& isAcq) {
+    return pImpl_->plStatus(config, isAcq);
+}
+
+bool IntanInterface::setConfig(FabricConfig config) {
+    return pImpl_->setConfig(config);
+}
+
+bool IntanInterface::ensureAcquisitionFabric() {
+    return pImpl_->ensureAcquisitionFabric();
+}
+
+bool IntanInterface::rescanFabric(ImuPorts& present) {
+    return pImpl_->rescanFabric(present);
+}
+
+bool IntanInterface::setImuStream(const ImuPorts& ports, uint32_t periodMs,
+                                  ImuPorts& active) {
+    return pImpl_->setImuStream(ports, periodMs, active);
+}
+
+void IntanInterface::getImuStats(ImuStats& stats) const {
+    pImpl_->getImuStats(stats);
 }
 
 void IntanInterface::setErrorCallback(ErrorCallback callback) {
