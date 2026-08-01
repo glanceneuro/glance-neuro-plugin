@@ -45,6 +45,28 @@
     using SOCKET = int;
 #endif
 
+// Non-blocking drain of an already-queued backlog (see the recv loop).
+//
+// Winsock has no MSG_DONTWAIT: non-blocking is a property of the SOCKET, not of
+// the call. Defining the flag to 0 would compile and then silently do the wrong
+// thing -- the drain would BLOCK for the full SO_RCVTIMEO every time the backlog
+// was empty, which is every normal wakeup. So on Windows the socket is flipped
+// non-blocking around the drain loop instead.
+//
+// The toggle is per BATCH, not per datagram, so it does not violate the
+// "no per-packet work on the receive path" rule: two ioctlsocket calls per
+// wakeup against up to kMaxRecvBatch datagrams.
+#ifdef _WIN32
+    #define RECV_DRAIN_FLAGS 0
+    static inline void recvSetNonBlocking(SOCKET s, bool on) {
+        u_long mode = on ? 1u : 0u;
+        ioctlsocket(s, FIONBIO, &mode);
+    }
+#else
+    #define RECV_DRAIN_FLAGS MSG_DONTWAIT
+    static inline void recvSetNonBlocking(SOCKET, bool) {}   // per-call flag suffices
+#endif
+
 // M_PI is a POSIX extension, not standard C++ -- MSVC's <cmath> omits it unless
 // _USE_MATH_DEFINES is set. Provide a portable fallback (used by the DSP filter
 // design below).
@@ -1519,10 +1541,13 @@ public:
             // (2) Drain every OTHER datagram already queued in the socket WITHOUT
             //     blocking -- this is the chunk. After a scheduling gap the whole
             //     backlog comes out in one pass (catch-up), capped at kMaxRecvBatch.
+            //     No-op on POSIX (MSG_DONTWAIT is per call); on Windows this is
+            //     what makes the drain non-blocking at all.
+            recvSetNonBlocking(udpSocket_, true);
             while (batch.size() < kMaxRecvBatch) {
                 Datagram b = takeBuf();
                 int m = recvfrom(udpSocket_, reinterpret_cast<char*>(b.bytes.data()),
-                                 kDatagramCap, MSG_DONTWAIT,
+                                 kDatagramCap, RECV_DRAIN_FLAGS,
                                  reinterpret_cast<struct sockaddr*>(&senderAddr),
                                  &senderLen);
                 if (m <= 0) {             // EAGAIN/EWOULDBLOCK: nothing more queued now
@@ -1532,6 +1557,9 @@ public:
                 b.len = (size_t)m;
                 batch.push_back(std::move(b));
             }
+            // Restore blocking so step (1) next time round still waits on
+            // SO_RCVTIMEO rather than spinning.
+            recvSetNonBlocking(udpSocket_, false);
 
             // (3) Publish the whole chunk under ONE lock + ONE notify, then top up the
             //     thread-local spare pool from the demux-returned free-list in bulk.
@@ -2228,8 +2256,9 @@ public:
     // overflow is counted (ringDrops_) and surfaced, never silently hidden.
     static constexpr size_t kRingMax = 200000;
     // Max datagrams the recv thread drains per wakeup into ONE locked hand-off, and the
-    // max the demux swaps out per wakeup. macOS has no recvmmsg(), so this MSG_DONTWAIT
-    // drain-into-chunk is the portable analogue of the acq-board's block reads: it
+    // max the demux swaps out per wakeup. macOS has no recvmmsg(), so this
+    // non-blocking drain-into-chunk is the portable analogue of the acq-board's
+    // block reads: it
     // amortizes the per-datagram lock/notify overhead ~256x and lets the recv thread
     // catch up after a scheduling gap (bigger backlog -> bigger chunk). Tunable.
     static constexpr size_t kMaxRecvBatch = 256;
