@@ -4,7 +4,7 @@
 # seven Apple secrets and then uploaded it to Open Ephys's Artifactory. None of
 # those credentials belong to this project, and it signed `ephys-socket.bundle`,
 # a filename this repo no longer produces.
-name: mac
+name: macOS
 
 on:
   push:

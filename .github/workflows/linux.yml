@@ -11,7 +11,7 @@
 # are kept because Source/IntanInterface.cpp carries real _WIN32 and __APPLE__
 # branches (winsock2 vs POSIX sockets, closesocket, the Apple-specific paths in
 # IntanSocket.cpp) that a Linux-only build cannot exercise.
-name: linux
+name: Linux
 
 on:
   push:

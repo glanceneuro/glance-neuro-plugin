@@ -9,6 +9,8 @@
 
 by the [Kemere Lab](https://kemerelab.com) at [Rice University](https://neuroengineering.rice.edu)
 
+[![Linux](https://github.com/glanceneuro/glance-neuro-plugin/actions/workflows/linux.yml/badge.svg?branch=main)](https://github.com/glanceneuro/glance-neuro-plugin/actions/workflows/linux.yml) [![macOS](https://github.com/glanceneuro/glance-neuro-plugin/actions/workflows/mac.yml/badge.svg?branch=main)](https://github.com/glanceneuro/glance-neuro-plugin/actions/workflows/mac.yml) [![Windows](https://github.com/glanceneuro/glance-neuro-plugin/actions/workflows/windows.yml/badge.svg?branch=main)](https://github.com/glanceneuro/glance-neuro-plugin/actions/workflows/windows.yml)
+
 </div>
 
 An Open Ephys GUI `DataThread` source plugin for the **GLANCE** MicroZed/Zynq-7020 Intan
