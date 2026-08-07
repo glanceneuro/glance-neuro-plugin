@@ -21,7 +21,7 @@ matrix-over-TCP source with the GLANCE device protocol:
 
 - **TCP control** (port 0x6900 / 26880): start/stop, configuration, chip auto-detection,
   and the aux-sequencer commands. `IntanInterface.{h,cpp}` is a standalone C++ client for
-  this protocol (no JUCE dependency) — the third consumer of the register/packet contract,
+  this protocol (no JUCE dependency) — the third implementation of the packet and register layout,
   after the firmware and `remote/net.py`.
 - **UDP data** (port 0x6800 / 26624): one packet per ~30 kHz sample; a per-stream header
   plus up to 140 data words depending on the channel-enable mask.
@@ -31,7 +31,7 @@ matrix-over-TCP source with the GLANCE device protocol:
 </p>
 
 The board firmware, the `remote/net.py` reference client, and this plugin are the
-**three consumers of the same register/packet contract** — see the
+**three implementations of the same packet and register layout** — see the
 [glance-neuro](https://github.com/glanceneuro/glance-neuro) repo when changing the protocol.
 
 ## Usage

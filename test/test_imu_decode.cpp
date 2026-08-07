@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Rice University
 //
-// Contract test for the plugin's IMU (stream_type = 3) decoder.
+// Cross-check for the plugin's IMU (stream_type = 3) decoder.
 //
-// The plugin is the THIRD consumer of the packet contract, after the firmware
+// The plugin is the THIRD implementation of the packet layout, after the firmware
 // and remote/net.py in glance-neuro, and nothing enforces its side
 // automatically (CLAUDE.md). This test closes that gap for the IMU stream: it
 // reads datagrams produced by the FIRMWARE's own host-test binary

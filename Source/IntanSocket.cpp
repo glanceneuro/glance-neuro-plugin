@@ -362,9 +362,9 @@ void IntanSocket::updateSettings(OwnedArray<ContinuousChannel>* continuousChanne
         // base name descriptive of the CONTENT rather than the device.
         "BroadbandStream",
         "Broadband 30 kHz amplifier data",
-        // Stream / channel identifiers stay `intan.*`: they are a metadata
-        // contract that lands in recordings and saved signal chains, not a
-        // display name. The product brand is GLANCE (see OpenEphysLib.cpp);
+        // Stream / channel identifiers stay `intan.*`: these land in recordings
+        // and saved signal chains, so they are not free to change -- they are
+        // not a display name. The product brand is GLANCE (see OpenEphysLib.cpp);
         // these name the Intan RHD data they carry.
         "intan.data",
         SAMPLE_RATE,

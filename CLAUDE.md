@@ -20,9 +20,9 @@ blocking NDOF entry on the board, so `startAcquisition()` starts the IMU **befor
 neural stream — that ordering is required, not incidental.
 
 `IntanInterface.{h,cpp}` is a standalone C++ client for the board protocol with no JUCE
-dependency. It is the **third consumer of the register/packet contract**, after the
+dependency. It is the **third implementation of the packet and register layout**, after the
 firmware and `remote/net.py` in
-[glance-neuro](https://github.com/glanceneuro/glance-neuro). Changing the contract means
+[glance-neuro](https://github.com/glanceneuro/glance-neuro). Changing that layout means
 changing all three, plus that repo's `docs/protocol.md` and `docs/register-map.md`.
 Nothing enforces the plugin's side automatically — the firmware and `net.py` are kept
 honest by a `_Static_assert` on the status struct, and this repo is checked by hand.
@@ -87,18 +87,18 @@ strips the header — re-add it.
 
 ```bash
 bash test/run_test.sh                              # no JUCE, no Open Ephys, no board
-bash test/run_imu_decode_test.sh [../glance-neuro] # IMU cross-repo contract test
+bash test/run_imu_decode_test.sh [../glance-neuro] # IMU cross-repo check
 ```
 
 `test/` holds a **differential** test of the one thing worth guarding here: it builds
 synthetic unified packets, decodes them with a standalone copy of the plugin's decode
 logic (`unified_parse_test.cpp`) and with a `net.py`-style reference decoder
 (`ref_decode.py`), and diffs the two. Any disagreement about header fields, demux, or
-per-stream SEQ-gap detection fails the run. It guards the wire-format contract rather
+per-stream SEQ-gap detection fails the run. It pins down the wire format rather
 than an implementation, which is why it earns its keep — keep it in step when the decode
 changes.
 
-`test/run_imu_decode_test.sh` guards the same contract for the IMU stream, but from the
+`test/run_imu_decode_test.sh` covers the same ground for the IMU stream, but from the
 other direction and across repos: it runs the **firmware's own** host test in
 glance-neuro (`firmware/test-host`, a simulated AXI IIC + BNO055) to emit real
 datagrams, then decodes those bytes with the plugin's field offsets and BNO055 scale

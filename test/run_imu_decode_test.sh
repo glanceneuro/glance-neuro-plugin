@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Rice University
 #
-# Cross-repo contract test: generate IMU datagrams with the FIRMWARE's host
+# Cross-repo check: generate IMU datagrams with the FIRMWARE's host
 # test (glance-neuro/firmware/test-host) and decode them with the plugin's
 # decoder. Fails if the two repos ever disagree on the wire format.
 #
