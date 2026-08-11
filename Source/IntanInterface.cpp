@@ -457,9 +457,13 @@ public:
         }
     };
 
+    // nackIsAnswer: the caller EXPECTS the board may refuse this command and
+    // handles the refusal itself, so a NACK is information rather than a fault
+    // and must not be surfaced as an error. Transport failures (timeout, closed
+    // socket, ACK-ID mismatch) are still reported -- those are real.
     bool sendCommand(CommandId cmdId, uint32_t param1 = 0, uint32_t param2 = 0,
                      uint8_t* responseData = nullptr, size_t* responseLen = nullptr,
-                     uint32_t timeoutMs = 0) {
+                     uint32_t timeoutMs = 0, bool nackIsAnswer = false) {
         std::lock_guard<std::mutex> lock(tcpMutex_);
 
         if (tcpSocket_ == INVALID_SOCKET) {
@@ -515,7 +519,8 @@ public:
         }
         
         if (status != ACK_SUCCESS) {
-            reportError("Command failed on device");
+            if (!nackIsAnswer)
+                reportError("Command failed on device");
             return false;
         }
         
@@ -889,7 +894,13 @@ public:
     bool detectImu(ImuPorts& present) {
         uint8_t data[12];
         size_t dataLen = sizeof(data);
-        if (!sendCommand(CMD_DETECT_IMU, 0, 0, data, &dataLen) || dataLen != 12)
+        // A refusal here is NORMAL, not a fault: the board boots on the plain
+        // acquisition fabric, which has no AXI IIC, and the firmware rightly
+        // NACKs DETECT_IMU rather than issuing an AXI read that would never
+        // return. The caller reports "no IMU census" and carries on, so raising
+        // an error popup on every connect would be a false alarm.
+        if (!sendCommand(CMD_DETECT_IMU, 0, 0, data, &dataLen, 0,
+                         /*nackIsAnswer=*/true) || dataLen != 12)
             return false;
         // Result bit 0 = present (ACKed AND chip_id == 0xA0).
         present.portA = (unpackU32LE(data) & 0x1) != 0;

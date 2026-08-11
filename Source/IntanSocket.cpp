@@ -1265,7 +1265,9 @@ void IntanSocket::refreshImuState()
 
     if (!censused)
     {
-        LOGC("GLANCE: no IMU census available on this fabric -- no IMU stream");
+        LOGC("GLANCE: no IMU census on this fabric (the default acquisition "
+             "fabric has no I2C) -- no IMU stream. RESCAN loads an acq_imu_* "
+             "fabric if a headstage IMU is present.");
     }
     else
     {
