@@ -1,7 +1,8 @@
 # CLAUDE.md
 
 Working notes for this repo. `README.md` says what the plugin is and
-[`docs/building.md`](docs/building.md) says how to build it — this file is the part
+[`docs/building.md`](docs/building.md) says how to build it and
+[`docs/latency.md`](docs/latency.md) how to tune it for closed loop — this file is the part
 that is easy to get wrong.
 
 ## What this is

@@ -938,6 +938,13 @@ public:
         errorCallback_ = callback;
     }
     
+    void getPipelineLatencyUs(int64_t& maxUs, int64_t& meanUs) {
+        maxUs = pipelineLatencyMaxUs_.exchange(0, std::memory_order_relaxed);
+        int64_t sum = pipelineLatencySumUs_.exchange(0, std::memory_order_relaxed);
+        uint64_t n = pipelineLatencyCount_.exchange(0, std::memory_order_relaxed);
+        meanUs = n ? (int64_t)(sum / (int64_t)n) : 0;
+    }
+
     void getReceptionStats(ReceptionStats& stats) const {
         std::lock_guard<std::mutex> lock(statsMutex_);
         
@@ -1547,6 +1554,7 @@ public:
                 continue;
             }
             buffer.len = (size_t)received;
+            buffer.recvAt = std::chrono::steady_clock::now();
             batch.push_back(std::move(buffer));
 
             // (2) Drain every OTHER datagram already queued in the socket WITHOUT
@@ -1566,6 +1574,7 @@ public:
                     break;
                 }
                 b.len = (size_t)m;
+                b.recvAt = std::chrono::steady_clock::now();
                 batch.push_back(std::move(b));
             }
             // Restore blocking so step (1) next time round still waits on
@@ -1616,8 +1625,19 @@ public:
             }
             if (!localBatch.empty()) {
                 // Decode the chunk OUTSIDE the lock so the recv thread keeps publishing.
-                for (auto& d : localBatch)
+                // Track socket->decode age as we go: this is the latency THIS PLUGIN
+                // adds before Open Ephys ever sees the sample, which is the only part
+                // we control. Read it with getPipelineLatencyUs(). Two int64 stores
+                // per datagram, no syscall -- the clock was already read at recv.
+                for (auto& d : localBatch) {
+                    int64_t ageUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - d.recvAt).count();
+                    if (ageUs > pipelineLatencyMaxUs_.load(std::memory_order_relaxed))
+                        pipelineLatencyMaxUs_.store(ageUs, std::memory_order_relaxed);
+                    pipelineLatencySumUs_.fetch_add(ageUs, std::memory_order_relaxed);
+                    pipelineLatencyCount_.fetch_add(1, std::memory_order_relaxed);
                     demuxDatagram(d.bytes.data(), d.len);
+                }
                 // Return the buffers to the free-list in bulk (one lock).
                 std::lock_guard<std::mutex> lock(ringMutex_);
                 for (auto& d : localBatch)
@@ -2285,8 +2305,19 @@ public:
     struct Datagram {
         std::vector<uint8_t> bytes;   // size() stays == kDatagramCap after first use
         size_t len = 0;               // actual payload length from recvfrom
+        // When recvfrom() handed this datagram over. Lets the consumer report the
+        // latency THIS PLUGIN adds (socket -> Open Ephys source buffer), which is
+        // the only part we control -- the standing depth of OE's own buffer is set
+        // by its process-callback cadence, not by us. One clock read per datagram,
+        // ~25 ns from the vDSO: 0.08% of a core at 30 kHz.
+        std::chrono::steady_clock::time_point recvAt{};
     };
     std::deque<Datagram> ring_;
+    // Socket -> demux-decode age, so the plugin's own contribution is measurable
+    // rather than assumed. Reset each time it is read.
+    std::atomic<int64_t> pipelineLatencyMaxUs_{0};
+    std::atomic<int64_t> pipelineLatencySumUs_{0};
+    std::atomic<uint64_t> pipelineLatencyCount_{0};
     std::mutex ringMutex_;
     std::condition_variable ringCv_;
     uint64_t ringDrops_ = 0;
@@ -2359,6 +2390,10 @@ bool IntanInterface::foundInputSource() const {
 
 bool IntanInterface::isReady() const {
     return pImpl_->isReady();
+}
+
+void IntanInterface::getPipelineLatencyUs(int64_t& maxUs, int64_t& meanUs) {
+    pImpl_->getPipelineLatencyUs(maxUs, meanUs);
 }
 
 bool IntanInterface::getStatus(DeviceStatus& status) const {

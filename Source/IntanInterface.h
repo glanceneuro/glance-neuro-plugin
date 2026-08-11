@@ -377,6 +377,19 @@ public:
      * @param stats Output parameter filled with reception stats
      */
     void getReceptionStats(ReceptionStats& stats) const;
+
+    /**
+     * @brief Latency this plugin adds: UDP socket -> demux decode, in microseconds.
+     *
+     * The part of the closed-loop path we control. What Open Ephys then does with
+     * the sample is paced by ITS process callback, which is a separate (and much
+     * larger) term. Both counters reset on read, so successive calls describe
+     * successive windows.
+     *
+     * @param maxUs [out] worst datagram in the window
+     * @param meanUs [out] mean over the window, 0 if no datagrams arrived
+     */
+    void getPipelineLatencyUs(int64_t& maxUs, int64_t& meanUs);
     
     // ========================================================================
     // AUTO-DETECTION

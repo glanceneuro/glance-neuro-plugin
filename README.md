@@ -74,6 +74,9 @@ to see it at the right scale.
 ## Further reading
 
 - [docs/building.md](docs/building.md) — Windows / Linux / macOS build instructions.
+- [docs/latency.md](docs/latency.md) — tuning for closed-loop work. **Read this before
+  building a ripple detector**: Open Ephys paces the whole signal chain off its audio
+  callback, 23 ms by default, and that is the dominant term — not this plugin.
 
 ## Attribution
 

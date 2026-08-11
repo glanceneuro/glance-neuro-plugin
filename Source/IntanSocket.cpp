@@ -976,7 +976,18 @@ bool IntanSocket::updateBuffer()
             // ~empty now that updateBuffer drains to empty. If sourceBuffer stays deep
             // while dataQueue is ~0, the standing depth is in OE's own buffer (a paced
             // consumer), not ours.
-            std::cout << "[IntanSocket][LATENCY] sourceBuffer=" << sb << " samp ("
+            int64_t plMaxUs = 0, plMeanUs = 0;
+            if (intanInterface)
+                intanInterface->getPipelineLatencyUs(plMaxUs, plMeanUs);
+            // Two DIFFERENT things, deliberately printed together:
+            //   plugin=   socket -> demux decode. Ours. Should be tens of us.
+            //   sourceBuffer= standing depth of Open Ephys's buffer, i.e. how long a
+            //                 sample waits for OE's process callback. Paced by the
+            //                 GUI's audio block size (1024 @ 44.1 kHz = 23 ms), NOT
+            //                 by us. This is the term that dominates closed-loop
+            //                 latency; see docs/latency.md.
+            std::cout << "[GLANCE][LATENCY] plugin=" << plMeanUs << " us mean / "
+                      << plMaxUs << " us max, sourceBuffer=" << sb << " samp ("
                       << (sb * 1000.0 / SAMPLE_RATE) << " ms), dataQueue=" << qsz
                       << "/" << kMaxDataQueue;
             if (d != lastDrops)
