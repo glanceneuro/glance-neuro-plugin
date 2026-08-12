@@ -45,26 +45,41 @@
     using SOCKET = int;
 #endif
 
-// Non-blocking drain of an already-queued backlog (see the recv loop).
+// How the recv loop waits, and how it drains the queued backlog behind that wait.
 //
 // Winsock has no MSG_DONTWAIT: non-blocking is a property of the SOCKET, not of
-// the call. Defining the flag to 0 would compile and then silently do the wrong
-// thing -- the drain would BLOCK for the full SO_RCVTIMEO every time the backlog
-// was empty, which is every normal wakeup. So on Windows the socket is flipped
-// non-blocking around the drain loop instead.
+// the call. So the two platforms reach the same behaviour differently, and the
+// SYSCALL COUNT PER DATAGRAM is what matters -- the recv thread has to keep
+// SO_RCVBUF drained at 30 kHz, and CPU burned here is exactly the time it does
+// not have to do that. (That is not hypothetical: an earlier buffer-churn bug in
+// this same loop cost ~42% of a core and showed up as SEQ gaps.)
 //
-// The toggle is per BATCH, not per datagram, so it does not violate the
-// "no per-packet work on the receive path" rule: two ioctlsocket calls per
-// wakeup against up to kMaxRecvBatch datagrams.
+//   Linux    blocking socket + SO_RCVTIMEO for the wait; MSG_DONTWAIT drains.
+//            -> recvfrom + recvfrom = 2 syscalls per datagram in steady state.
+//   Windows  socket is set non-blocking ONCE at bind and stays that way; the
+//            wait is WSAPoll, the drain is plain recvfrom returning
+//            WSAEWOULDBLOCK when empty.
+//            -> WSAPoll + recvfrom + recvfrom = 3.
+//
+// An earlier version toggled the socket with ioctlsocket(FIONBIO) around the
+// drain instead. Its comment claimed the toggle was "per batch, not per
+// datagram" -- but in steady state the recv thread keeps up, so a batch IS one
+// datagram, and it cost 4 syscalls each: two of them ioctlsocket, which is not
+// on the kernel's fast receive path at all.
 #ifdef _WIN32
     #define RECV_DRAIN_FLAGS 0
-    static inline void recvSetNonBlocking(SOCKET s, bool on) {
-        u_long mode = on ? 1u : 0u;
-        ioctlsocket(s, FIONBIO, &mode);
+    // Block until readable or timeout. Returns false on timeout/error so the
+    // caller re-checks running_, matching SO_RCVTIMEO's role on Linux.
+    static inline bool recvWaitReadable(SOCKET s, int timeoutMs) {
+        WSAPOLLFD fd{};
+        fd.fd = s;
+        fd.events = POLLRDNORM;
+        return WSAPoll(&fd, 1, timeoutMs) > 0 && (fd.revents & (POLLRDNORM | POLLHUP));
     }
 #else
     #define RECV_DRAIN_FLAGS MSG_DONTWAIT
-    static inline void recvSetNonBlocking(SOCKET, bool) {}   // per-call flag suffices
+    // No-op: the blocking recvfrom below already waits, bounded by SO_RCVTIMEO.
+    static inline bool recvWaitReadable(SOCKET, int) { return true; }
 #endif
 
 // M_PI is a POSIX extension, not standard C++ -- MSVC's <cmath> omits it unless
@@ -1514,6 +1529,18 @@ public:
         struct timeval tv;
         tv.tv_sec = 1;
         tv.tv_usec = 0;
+#ifdef _WIN32
+        // Windows: non-blocking for the LIFETIME of the socket. recvWaitReadable
+        // (WSAPoll) supplies the blocking wait, and the drain then relies on
+        // recvfrom returning WSAEWOULDBLOCK on an empty queue. Set once here, so
+        // the 30 kHz recv path never calls ioctlsocket at all. SO_RCVTIMEO below
+        // is inert in non-blocking mode; it is left set so the two platforms
+        // configure the socket identically and the timeout value lives in one place.
+        {
+            u_long nonBlocking = 1;
+            ioctlsocket(udpSocket_, FIONBIO, &nonBlocking);
+        }
+#endif
         setsockopt(udpSocket_, SOL_SOCKET, SO_RCVTIMEO,
                    reinterpret_cast<char*>(&tv), sizeof(tv));
 
@@ -1541,9 +1568,14 @@ public:
             struct sockaddr_in senderAddr;
             socklen_t senderLen = sizeof(senderAddr);
 
-            // (1) BLOCKING recv for the first datagram of the chunk. SO_RCVTIMEO makes
-            //     this return ~once/sec when idle so we can re-check running_. recvfrom
-            //     into the fixed kDatagramCap buffer; record the length, never resize.
+            // (1) Wait for the first datagram of the chunk, then take it. On Linux
+            //     the recvfrom below blocks (SO_RCVTIMEO bounds it); on Windows the
+            //     socket is non-blocking, so recvWaitReadable does the blocking with
+            //     the same ~1 s bound. Either way this returns periodically when idle
+            //     so running_ gets re-checked. recvfrom into the fixed kDatagramCap
+            //     buffer; record the length, never resize.
+            if (!recvWaitReadable(udpSocket_, 1000))
+                continue;                 // idle timeout, or the socket went away
             Datagram buffer = takeBuf();
             int received = recvfrom(udpSocket_, reinterpret_cast<char*>(buffer.bytes.data()),
                                     kDatagramCap, 0,
@@ -1560,9 +1592,6 @@ public:
             // (2) Drain every OTHER datagram already queued in the socket WITHOUT
             //     blocking -- this is the chunk. After a scheduling gap the whole
             //     backlog comes out in one pass (catch-up), capped at kMaxRecvBatch.
-            //     No-op on POSIX (MSG_DONTWAIT is per call); on Windows this is
-            //     what makes the drain non-blocking at all.
-            recvSetNonBlocking(udpSocket_, true);
             while (batch.size() < kMaxRecvBatch) {
                 Datagram b = takeBuf();
                 int m = recvfrom(udpSocket_, reinterpret_cast<char*>(b.bytes.data()),
@@ -1577,9 +1606,6 @@ public:
                 b.recvAt = std::chrono::steady_clock::now();
                 batch.push_back(std::move(b));
             }
-            // Restore blocking so step (1) next time round still waits on
-            // SO_RCVTIMEO rather than spinning.
-            recvSetNonBlocking(udpSocket_, false);
 
             // (3) Publish the whole chunk under ONE lock + ONE notify, then top up the
             //     thread-local spare pool from the demux-returned free-list in bulk.
