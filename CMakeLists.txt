@@ -20,7 +20,15 @@ set(CMAKE_SHARED_LIBRARY_PREFIX "")
 if(${CMAKE_SYSTEM_NAME} STREQUAL "Linux")
 	set(LINUX 1)
 	if(NOT CMAKE_BUILD_TYPE)
+		# Unix Makefiles is single-config, so the type is fixed HERE and --config at
+		# build time is ignored. Defaulting silently to Debug is a trap: it defines
+		# DEBUG=1/_DEBUG=1 and omits NDEBUG, and a Debug plugin loaded into a Release
+		# GUI can crash rather than fail cleanly. Keep the upstream default (the GUI
+		# does the same) but say so, so the choice is visible at the moment it is made.
 		set(CMAKE_BUILD_TYPE Debug)
+		message(STATUS
+			"CMAKE_BUILD_TYPE not set -- defaulting to Debug. "
+			"Pass -DCMAKE_BUILD_TYPE=Release to match a Release Open Ephys GUI.")
 	endif()
 endif()
 

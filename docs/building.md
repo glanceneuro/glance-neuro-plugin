@@ -52,8 +52,14 @@ pick one when you build.
 
 Leaving it off is not neutral. `CMakeLists.txt` explicitly defaults Linux to
 **Debug**, which defines `DEBUG=1` / `_DEBUG=1` and leaves `NDEBUG` undefined —
-the mismatch warned about below. (Optimization is not what differs: `-O3` is
-forced on Linux for both build types.)
+the mismatch warned about below. Configure says so when it happens:
+
+```
+-- CMAKE_BUILD_TYPE not set -- defaulting to Debug. Pass -DCMAKE_BUILD_TYPE=Release
+   to match a Release Open Ephys GUI.
+```
+
+(Optimization is not what differs: `-O3` is forced on Linux for both build types.)
 
 **macOS**: the default install location is the shared plugin folder, which is
 usually *not* what you want while developing — it will be picked up by any GUI
