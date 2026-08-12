@@ -38,15 +38,22 @@ cmake --build Build --config Release --target install
 | | Windows | Linux | macOS |
 |---|---|---|---|
 | **needs** | [Visual Studio](https://visualstudio.microsoft.com/) + [CMake](https://cmake.org/install/) | [CMake](https://cmake.org/install/) | [Xcode](https://developer.apple.com/xcode/) + [CMake](https://cmake.org/install/) |
-| **`<generator>`** | `"Visual Studio 17 2022" -A x64` | `"Unix Makefiles" -DCMAKE_BUILD_TYPE=Release` | `"Xcode"` |
+| **`<generator>`** | `"Visual Studio 17 2022" -A x64` | `"Unix Makefiles"` | `"Xcode"` |
+| **build type** | `--config Release` at step 2 | **`-DCMAKE_BUILD_TYPE=Release` at step 1** | `--config Release` at step 2 |
 | **install target** | `INSTALL` (capitalized) | `install` | `install`, but see below |
 | **lands in** | the GUI build's `plugins/` | the GUI build's `plugins/` | `~/Library/Application Support/open-ephys/plugins-api10` |
 | **artifact** | `glance-neuro-plugin.dll` | `glance-neuro-plugin.so` | `glance-neuro-plugin.bundle` |
 
-**Linux** is single-config: the build type is fixed at configure time by
-`-DCMAKE_BUILD_TYPE`, so `--config` on the build command does nothing. Windows
-and macOS are multi-config and take `--config Release` (or `Debug`) at build
-time.
+**Why Linux needs `-DCMAKE_BUILD_TYPE` and the others do not.** `Unix Makefiles`
+is a *single-config* generator: the build type is baked into the makefiles when
+you configure, and `--config` at build time is silently ignored. Visual Studio
+and Xcode are *multi-config* — they emit every configuration up front and you
+pick one when you build.
+
+Leaving it off is not neutral. `CMakeLists.txt` explicitly defaults Linux to
+**Debug**, which defines `DEBUG=1` / `_DEBUG=1` and leaves `NDEBUG` undefined —
+the mismatch warned about below. (Optimization is not what differs: `-O3` is
+forced on Linux for both build types.)
 
 **macOS**: the default install location is the shared plugin folder, which is
 usually *not* what you want while developing — it will be picked up by any GUI
